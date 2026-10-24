@@ -9,14 +9,15 @@ A repository-agnostic controller for research jobs.
   - **at most one accepted result per task**;
   - no silent reuse of results when code or environments change.
 
-**Status:** M0–M5.
+**Status:** all planned milestones (M0–M6).
 - M0 + M1: core model, runner shim, responsiveness benchmark.
 - M2: Pueue execution, gates, adaptive daemon.
 - M3: Slurm arrays over SSH; smoke-tested on the SWC cluster.
 - M4: manual mixed routing, cancel, retry, logs.
 - M5: activity detection and `mode auto`.
+- M6: automatic local-first routing with cluster overflow.
 
-Coming next: M6, local-first routing with HPC overflow.
+Deferred: the `throughput-first` policy, runtime prediction from history, and data staging.
 
 ## Quick start
 
@@ -30,6 +31,36 @@ uv run switchboard status
 uv run switchboard explain synthetic-grid/3
 uv run switchboard results synthetic-grid --json
 ```
+
+**Automatic routing (`--backend auto`):**
+
+```yaml
+placement:
+  policy: local-first          # or local-only, hpc-only
+  max_local_wait_h: 6          # overflow work the Mac would not finish within this
+  platforms: [osx-arm64, linux-64]
+resources: {cpus: 1, mem_gb: 2, runtime_min: 30}   # the declared runtime drives the estimate
+```
+
+```bash
+switchboard submit grid.yaml --backend auto
+switchboard explain grid/150    # routing: [R5] local-first overflow: the Mac would finish it in ~9.4 h ...
+switchboard policy grid hpc-only
+```
+
+Every pass, pending tasks are routed in queue order. The first rule that applies wins:
+
+| Rule | When | Result |
+|---|---|---|
+| R1 | the policy is `local-only` or `hpc-only` | that backend |
+| R2 | the Mac can't run the task (platform, or more CPUs/memory than its largest budget) | cluster |
+| R3 | the cluster isn't usable (not configured, unreachable, no `backends.hpc`, or a code/env identity mismatch, checked once over SSH) | Mac |
+| R4 | there is no runtime estimate | Mac |
+| R5 | `local-first` | see below |
+
+Under R5, the Mac keeps whatever it would finish within `max_local_wait_h`. It counts the work it already owes, divided by the CPUs of the current budget profile. The tail of the queue overflows to the cluster as Slurm arrays.
+
+Routing is late-bound: pending tasks are re-evaluated on every pass, and dispatched tasks never move. `switchboard assign` turns automatic routing off for that experiment, and `switchboard policy EXP local-first` turns it back on.
 
 **Splitting one experiment by hand:**
 
@@ -193,6 +224,7 @@ See [examples/synthetic-grid.yaml](examples/synthetic-grid.yaml). The sections a
 | `daemon.py`, `launchd.py` | adaptive background loop with nudge socket and lock; LaunchAgent install |
 | `controller.py` | submit/assign with identity pinning, reconcile, acceptance CAS, admission |
 | `policy.py` | pure static-budget admission |
+| `routing.py` | pure routing rules R1–R5 with explainable decisions |
 | `tools/synth.py` | synthetic workloads |
 | `tools/bench_responsiveness.py` | QoS / responsiveness benchmark (run on AC power) |
 

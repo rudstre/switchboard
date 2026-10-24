@@ -294,6 +294,13 @@ class SlurmExecutor:
 
     # -- Executor protocol ---------------------------------------------------------------------
 
+    def check(self) -> None:
+        """Raise BackendUnreachable unless the cluster answers right now (one round trip)."""
+        try:
+            self.transport.check()
+        except (TransportDown, TransportLost) as exc:
+            raise BackendUnreachable(str(exc)) from exc
+
     def fingerprint(self, provider: dict, workdir: str, setup: str | None) -> str:
         from ..runner.fingerprint import FingerprintError
 

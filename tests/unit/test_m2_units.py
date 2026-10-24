@@ -55,11 +55,15 @@ def test_long_home_falls_back_to_short_socket_path(tmp_path):
 def test_schema_v1_database_is_upgraded(tmp_path):
     path = tmp_path / "old.db"
     conn = db.connect(path)
-    conn.execute("ALTER TABLE tasks DROP COLUMN cancel_requested")
+    conn.execute("ALTER TABLE tasks DROP COLUMN cancel_requested")  # make it look like a v1 registry
+    conn.execute("ALTER TABLE experiments DROP COLUMN policy")
+    conn.execute("DROP TABLE experiment_backends")
+    conn.execute("ALTER TABLE tasks DROP COLUMN route_note")
     conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
     conn.close()
     conn = db.connect(path)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
     assert "cancel_requested" in cols
-    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "2"
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "4"
+    assert "policy" in {r[1] for r in conn.execute("PRAGMA table_info(experiments)")}
     assert isinstance(conn, sqlite3.Connection)

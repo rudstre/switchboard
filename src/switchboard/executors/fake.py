@@ -52,6 +52,9 @@ class FakeExecutor(LocalStatusReader):
 
     # -- Executor protocol ---------------------------------------------------------------------
 
+    def check(self) -> None:
+        self._check_reachable()
+
     def fingerprint(self, provider: dict, workdir: str, setup: str | None) -> str:
         self._check_reachable()
         return fp.evaluate(provider, workdir, setup)

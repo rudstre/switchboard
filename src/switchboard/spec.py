@@ -110,6 +110,14 @@ class BackendSpec(_Model):
     slurm: SlurmOptions | None = None
 
 
+class Placement(_Model):
+    """How `submit --backend auto` routes tasks. Not part of the identity: changing it reuses results."""
+
+    policy: Literal["local-first", "local-only", "hpc-only"] = "local-first"
+    max_local_wait_h: float = Field(6.0, gt=0)  # local-first: overflow work the Mac would not reach by then
+    platforms: list[str] = ["osx-arm64", "linux-64"]  # where this code can run
+
+
 class ParamsSpec(_Model):
     grid: dict[str, Any] = {}
     zip: dict[str, list[Any]] = {}
@@ -135,6 +143,7 @@ class ExperimentSpec(_Model):
     interruptible: bool = False
     retries: Retries = Retries()
     compat: Literal["slurm-array"] | None = None
+    placement: Placement = Placement()
     backends: dict[BackendName, BackendSpec] = {}
 
 

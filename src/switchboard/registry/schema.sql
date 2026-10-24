@@ -1,4 +1,4 @@
--- switchboard registry, schema version 2.
+-- switchboard registry, schema version 4.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     identity_json TEXT NOT NULL,     -- canonical identity fields, used for diffs on refusal
     code_id       TEXT,              -- pinned before any dispatch; NULL when the spec defines no code identity
     code_id_source TEXT,             -- 'evaluated:<backend>' | 'explicit'
+    policy        TEXT NOT NULL DEFAULT 'manual',  -- manual | local-first | local-only | hpc-only
     created_at    REAL NOT NULL,
     UNIQUE (name, run_no)
 );
@@ -39,7 +40,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     runtime_s           REAL,
     assigned_backend    TEXT,
     state               TEXT NOT NULL,
-    note                TEXT,          -- latest routing/admission reason, shown by `explain`
+    note                TEXT,          -- latest admission/dispatch reason, shown by `explain`
+    route_note          TEXT,          -- latest routing decision for auto-routed experiments
     accepted_attempt_id TEXT,
     retries_used        INTEGER NOT NULL DEFAULT 0,
     cancel_requested    INTEGER NOT NULL DEFAULT 0,  -- user asked; otherwise a CANCELLED runner was interrupted
@@ -100,4 +102,14 @@ CREATE INDEX IF NOT EXISTS events_by_entity ON events (entity, entity_id);
 CREATE TABLE IF NOT EXISTS control (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Whether a backend may run an experiment's tasks: identities checked there before routing to it.
+CREATE TABLE IF NOT EXISTS experiment_backends (
+    experiment_id INTEGER NOT NULL REFERENCES experiments(id),
+    backend       TEXT NOT NULL,
+    ok            INTEGER NOT NULL,
+    detail        TEXT,
+    checked_at    REAL NOT NULL,
+    PRIMARY KEY (experiment_id, backend)
 );

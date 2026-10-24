@@ -20,7 +20,7 @@ from typing import Any
 
 import psutil
 
-from . import policy
+from . import policy, routing
 from .activity import PROFILE, ActivityState, classify
 from .config import Config
 from .executors.base import (
@@ -81,6 +81,7 @@ class SubmitResult:
     env_ids: dict[str, str]
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    policy: str = "manual"
 
 
 @dataclass
@@ -92,6 +93,7 @@ class TickReport:
     cancelled: int = 0
     retried: int = 0
     requeued: int = 0
+    rerouted: int = 0
     abandoned: int = 0
     ambiguous: int = 0
     unreachable: list[str] = field(default_factory=list)
@@ -123,6 +125,7 @@ class Controller:
         # Callable(local_tasks_running) -> activity.Sample; drives `mode auto`. None: no sensors.
         self.activity_sensor = activity_sensor
         self._specs: dict[int, ExperimentSpec] = {}
+        self._profile: tuple[str, str, str] | None = None  # effective profile, sampled once per tick
 
     # ==== submission ===========================================================================
 
@@ -136,6 +139,13 @@ class Controller:
         dry_run: bool = False,
     ) -> SubmitResult:
         spec = loaded.spec
+        policy = "manual"
+        if backend == "auto":
+            if tasks is not None:
+                raise SwitchboardError("--tasks selects tasks for a manual backend; auto routes every task")
+            policy = spec.placement.policy
+            # Pin identities where the code will run first: the Mac unless the spec rules it out.
+            backend = "local" if "local" in spec.backends and "local" in self.executors else "hpc"
         executor = self._executor_for(spec, backend)
         defs = expand(loaded)
         selected = parse_selection(tasks, len(defs))
@@ -163,23 +173,25 @@ class Controller:
                     + "\nCompleted results will not be reused. Re-run with --new-run to start "
                     f"'{spec.experiment}#{existing['run_no'] + 1}'."
                 )
-            return self._resubmit(existing, loaded, backend, executor, selected, env_id, warnings, dry_run)
+            return self._resubmit(existing, loaded, backend, executor, selected, env_id, warnings, dry_run, policy)
 
         run_no = existing["run_no"] + 1 if existing is not None else 1
         name = display_name(spec.experiment, run_no)
         env_ids = {executor.platform: env_id} if env_id else {}
-        result = SubmitResult(name, True, len(defs), len(selected), backend, pinned_code, env_ids, warnings, dry_run)
+        result = SubmitResult(name, True, len(defs), len(selected), backend if policy == "manual" else "auto",
+                              pinned_code, env_ids, warnings, dry_run, policy)
         if dry_run:
             return result
         now = self.clock()
         with db.tx(self.conn):
             cur = self.conn.execute(
                 "INSERT INTO experiments(name, run_no, spec_text, spec_json, spec_dir, spec_hash, identity_json, "
-                "code_id, code_id_source, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "code_id, code_id_source, policy, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (spec.experiment, run_no, loaded.source_text, spec.model_dump_json(), str(loaded.base_dir),
-                 spec_hash, identity_json, pinned_code, code_source, now),
+                 spec_hash, identity_json, pinned_code, code_source, policy, now),
             )
             exp_id = cur.lastrowid
+            self._record_backend_check(exp_id, backend, True, "identities pinned here at submit")
             if env_id:
                 self.conn.execute(
                     "INSERT INTO experiment_envs(experiment_id, platform, env_id, pinned_at) VALUES (?,?,?,?)",
@@ -192,13 +204,15 @@ class Controller:
                 [
                     (exp_id, d.idx, d.key, canonical_json(d.params), d.seed, r.cpus, r.mem_mb,
                      r.runtime_min * 60 if r.runtime_min else None,
-                     backend if d.idx in selected else None, PENDING,
-                     f"assigned to {backend} at submit" if d.idx in selected else "unassigned", now)
+                     None if policy != "manual" else (backend if d.idx in selected else None), PENDING,
+                     f"awaiting {policy} routing" if policy != "manual" else
+                     (f"assigned to {backend} at submit" if d.idx in selected else "unassigned"), now)
                     for d in defs
                 ],
             )
             log_event(self.conn, "experiment", exp_id, None, "CREATED",
-                      f"{len(defs)} tasks, {len(selected)} assigned to {backend}; code {short(pinned_code)}"
+                      (f"{len(defs)} tasks, routed by {policy}" if policy != "manual" else
+                       f"{len(defs)} tasks, {len(selected)} assigned to {backend}") + f"; code {short(pinned_code)}"
                       f" ({code_source or 'none'}); env[{executor.platform}] {short(env_id)}", self.actor)
         return result
 
@@ -223,7 +237,56 @@ class Controller:
             selected = set(sorted(selected, reverse=True)[:count])
         with db.tx(self.conn):
             self._pin_env(exp["id"], executor.platform, env_id)
+            self._record_backend_check(exp["id"], backend, True, "identities match")
+            if exp["policy"] != "manual":
+                self.conn.execute("UPDATE experiments SET policy='manual' WHERE id=?", (exp["id"],))
+                log_event(self.conn, "experiment", exp["id"], exp["policy"], "manual",
+                          "manual assign: automatic routing turned off for this experiment", self.actor)
             return self._assign_pending(exp["id"], backend, selected)
+
+    def set_policy(self, experiment: str, policy: str) -> None:
+        if policy not in ("manual", "local-first", "local-only", "hpc-only"):
+            raise SwitchboardError(f"unknown policy {policy!r}; use manual, local-first, local-only or hpc-only")
+        exp = self._experiment(experiment)
+        with db.tx(self.conn):
+            self.conn.execute("UPDATE experiments SET policy=? WHERE id=?", (policy, exp["id"]))
+            log_event(self.conn, "experiment", exp["id"], exp["policy"], policy, "routing policy set", self.actor)
+
+    def _record_backend_check(self, exp_id: int, backend: str, ok: bool, detail: str) -> None:
+        self.conn.execute(
+            "INSERT INTO experiment_backends(experiment_id, backend, ok, detail, checked_at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(experiment_id, backend) DO UPDATE SET ok=excluded.ok, detail=excluded.detail, "
+            "checked_at=excluded.checked_at", (exp_id, backend, int(ok), detail, self.clock()))
+
+    def _backend_identity(self, exp: sqlite3.Row, backend: str) -> str | None:
+        """None if `backend` may run this experiment; else why not. Checked over the network once, then cached."""
+        row = self.conn.execute("SELECT ok, detail FROM experiment_backends WHERE experiment_id=? AND backend=?",
+                                (exp["id"], backend)).fetchone()
+        if row is not None:
+            return None if row["ok"] else row["detail"]
+        spec = self._spec(exp)
+        executor = self.executors[backend]
+        try:
+            code, _ = self._evaluate_code(spec, backend, executor, None, exp["spec_dir"])
+            env_id = self._evaluate_env(spec, backend, executor, exp["spec_dir"])
+        except SwitchboardError as exc:
+            if isinstance(exc.__cause__, BackendUnreachable):
+                return "cluster identity not checked yet (unreachable)"
+            detail = f"identity check failed on {backend}: {exc}"
+            with db.tx(self.conn):
+                self._record_backend_check(exp["id"], backend, False, detail)
+            return detail
+        problems = self._identity_diff(exp, exp["spec_hash"], exp["identity_json"], code, executor.platform, env_id)
+        with db.tx(self.conn):
+            if problems:
+                self._record_backend_check(exp["id"], backend, False, f"identity mismatch on {backend}: "
+                                           + "; ".join(problems))
+            else:
+                self._pin_env(exp["id"], executor.platform, env_id)
+                self._record_backend_check(exp["id"], backend, True, "identities match")
+            log_event(self.conn, "experiment", exp["id"], None, None,
+                      f"{backend} identity check: {'; '.join(problems) or 'ok'}", self.actor)
+        return f"identity mismatch on {backend}: " + "; ".join(problems) if problems else None
 
     def cancel(self, ref: str) -> dict[str, int]:
         """Cancel a task (EXP/KEY) or every unfinished task of an experiment (EXP)."""
@@ -273,14 +336,16 @@ class Controller:
         exp = self._experiment(ref)
         return self.conn.execute("SELECT * FROM tasks WHERE experiment_id=? ORDER BY idx", (exp["id"],)).fetchall()
 
-    def _resubmit(self, existing, loaded, backend, executor, selected, env_id, warnings, dry_run) -> SubmitResult:
+    def _resubmit(self, existing, loaded, backend, executor, selected, env_id, warnings, dry_run,
+                  policy="manual") -> SubmitResult:
         spec = loaded.spec
         n_total = self.conn.execute("SELECT count(*) FROM tasks WHERE experiment_id=?", (existing["id"],)).fetchone()[0]
         envs = self._envs(existing["id"])
         if env_id:
             envs.setdefault(executor.platform, env_id)
-        result = SubmitResult(display_name(existing["name"], existing["run_no"]), False, n_total, 0, backend,
-                              existing["code_id"], envs, warnings, dry_run)
+        result = SubmitResult(display_name(existing["name"], existing["run_no"]), False, n_total, 0,
+                              backend if policy == "manual" else "auto", existing["code_id"], envs, warnings,
+                              dry_run, policy)
         if dry_run:
             return result
         r = spec.resources
@@ -293,10 +358,14 @@ class Controller:
                 (r.cpus, r.mem_mb, r.runtime_min * 60 if r.runtime_min else None, existing["id"], PENDING),
             )
             self._pin_env(existing["id"], executor.platform, env_id)
-            result.tasks_assigned = self._assign_pending(existing["id"], backend, selected)
+            self.conn.execute("UPDATE experiments SET policy=? WHERE id=?", (policy, existing["id"]))
+            self._record_backend_check(existing["id"], backend, True, "identities match")
+            if policy == "manual":
+                result.tasks_assigned = self._assign_pending(existing["id"], backend, selected)
             log_event(self.conn, "experiment", existing["id"], None, None,
-                      f"resubmitted unchanged identity; {result.tasks_assigned} pending tasks assigned to {backend}",
-                      self.actor)
+                      "resubmitted unchanged identity; " + (
+                          f"{result.tasks_assigned} pending tasks assigned to {backend}" if policy == "manual"
+                          else f"routing policy {policy}"), self.actor)
         self._specs.pop(existing["id"], None)
         return result
 
@@ -357,21 +426,129 @@ class Controller:
     # ==== tick =================================================================================
 
     def tick(self, remote: bool = True) -> TickReport:
-        """One pass. ``remote=False`` skips cluster backends (the daemon throttles those)."""
+        """One pass: reconcile, route pending auto tasks, submit to the cluster, admit locally.
+
+        ``remote=False`` skips cluster backends (the daemon throttles those)."""
         report = TickReport()
+        self._profile = self.effective_profile()
         for name, executor in self.executors.items():
             if name != "local" and not remote:
                 continue
             try:
+                if name != "local" and hasattr(executor, "check"):
+                    executor.check()  # know reachability even when there is nothing to reconcile
                 self._reconcile_submitting(name, executor, report)
                 self._reconcile_active(name, executor, report)
-                if name != "local":
-                    self._dispatch_remote(executor, report)
+                self._set_reachable(name, True)
+            except BackendUnreachable as exc:
+                report.unreachable.append(name)
+                self._set_reachable(name, False)
+                self._mark_unknown(name, str(exc))
+        self._route(report)
+        for name, executor in self.executors.items():
+            if name == "local" or not remote or name in report.unreachable:
+                continue
+            try:
+                self._dispatch_remote(executor, report)
             except BackendUnreachable:
                 report.unreachable.append(name)
+                self._set_reachable(name, False)
         if "local" in self.executors and "local" not in report.unreachable:
-            self._admit_local(self.executors["local"], report)
+            try:
+                self._admit_local(self.executors["local"], report)
+            except BackendUnreachable:
+                report.unreachable.append("local")
+        self._profile = None
         return report
+
+    def _mark_unknown(self, backend: str, why: str) -> None:
+        """Unreachable backend: its active attempts become UNKNOWN (never failed, never resubmitted)."""
+        rows = self.conn.execute(f"SELECT id FROM attempts WHERE backend=? AND state IN ('{SUBMITTED}','{RUNNING}')",
+                                 (backend,)).fetchall()
+        if rows:
+            with db.tx(self.conn):
+                for r in rows:
+                    transition(self.conn, "attempt", r["id"], UNKNOWN, f"{backend} unreachable: {why[:200]}",
+                               self.actor, unknown_since=self.clock())
+
+    def _set_reachable(self, backend: str, ok: bool) -> None:
+        key = f"reachable:{backend}"
+        if self.get_control(key, "") != ("1" if ok else "0"):
+            with db.tx(self.conn):
+                self.conn.execute("INSERT INTO control(key, value) VALUES (?,?) "
+                                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, "1" if ok else "0"))
+                log_event(self.conn, "control", key, None, "reachable" if ok else "unreachable",
+                          f"{backend} {'reachable' if ok else 'unreachable'}", self.actor)
+
+    def _route(self, report: TickReport) -> None:
+        """Assign pending tasks of auto-routed experiments (late binding: re-evaluated every pass)."""
+        exps = {r["id"]: r for r in self.conn.execute(
+            "SELECT * FROM experiments WHERE policy != 'manual' AND id IN (SELECT DISTINCT experiment_id FROM tasks "
+            "WHERE state=?)", (PENDING,))}
+        if not exps:
+            return
+        hpc_configured = "hpc" in self.executors
+        hpc_reachable = hpc_configured and self.get_control("reachable:hpc", "1") == "1"
+        route_exps = {}
+        for exp_id, exp in exps.items():
+            spec = self._spec(exp)
+            identity = None
+            if hpc_configured and hpc_reachable and "hpc" in spec.backends and spec.placement.policy != "local-only":
+                identity = self._backend_identity(exp, "hpc")
+            route_exps[exp_id] = routing.RouteExperiment(
+                exp_id, exp["policy"], spec.placement.max_local_wait_h * 3600, tuple(spec.placement.platforms),
+                "local" in spec.backends and "local" in self.executors, "hpc" in spec.backends, identity)
+        tasks = self.conn.execute(
+            f"SELECT t.* FROM tasks t JOIN experiments e ON e.id=t.experiment_id WHERE t.state=? AND "
+            f"t.experiment_id IN ({','.join('?' * len(exps))}) ORDER BY e.created_at, t.idx",
+            (PENDING, *exps)).fetchall()
+        _, profile, _ = self._profile or self.effective_profile()
+        budget = self.cfg.budgets[profile]
+        ctx = routing.RouteContext(
+            capacity_cpus=budget.cpus, profile=profile,
+            max_local_cpus=max(b.cpus for b in self.cfg.budgets.values()),
+            max_local_mem_mb=max(b.mem_mb for b in self.cfg.budgets.values()),
+            local_platform=self.executors["local"].platform if "local" in self.executors else "osx-arm64",
+            hpc_platform=self.executors["hpc"].platform if hpc_configured else "linux-64",
+            hpc_configured=hpc_configured, hpc_reachable=hpc_reachable,
+            committed_local_cpu_s=self._committed_local_cpu_s(),
+        )
+        rts = [routing.RouteTask(t["id"], t["experiment_id"], t["cpus"], t["mem_mb"], t["runtime_s"]) for t in tasks]
+        decisions = routing.route(rts, route_exps, ctx)
+        changes = []
+        for t in tasks:
+            d = decisions[t["id"]]
+            if d.backend != t["assigned_backend"] or d.note != t["route_note"]:
+                changes.append((t, d))
+        if changes:
+            with db.tx(self.conn):
+                for t, d in changes:
+                    # `note` keeps the admission/dispatch reason once there is one; routing has its own column.
+                    note = t["note"] if d.backend == "local" and t["assigned_backend"] == "local" else d.note
+                    self.conn.execute("UPDATE tasks SET assigned_backend=?, route_note=?, note=?, updated_at=? "
+                                      "WHERE id=?", (d.backend, d.note, note, self.clock(), t["id"]))
+                    if d.backend != t["assigned_backend"]:
+                        log_event(self.conn, "task", t["id"], PENDING, PENDING,
+                                  f"routed to {d.backend or 'nowhere yet'}: {d.note}", self.actor)
+                        report.rerouted += 1
+        with db.tx(self.conn):
+            self.conn.execute("INSERT INTO control(key, value) VALUES ('local_drain_s', ?) ON CONFLICT(key) "
+                              "DO UPDATE SET value=excluded.value",
+                              (str(round(routing.local_drain_s(decisions, rts, ctx))),))
+
+    def _committed_local_cpu_s(self) -> float:
+        """Work the Mac already owes: running local attempts' remaining time + manually assigned local tasks."""
+        now = self.clock()
+        running = self.conn.execute(
+            f"SELECT t.cpus, t.runtime_s, a.started_at, a.created_at FROM attempts a JOIN tasks t ON t.id=a.task_id "
+            f"WHERE a.backend='local' AND a.state IN {ACTIVE_SQL}").fetchall()
+        total = sum(r["cpus"] * max(0.0, (r["runtime_s"] or 0) - (now - (r["started_at"] or r["created_at"])))
+                    for r in running)
+        manual = self.conn.execute(
+            "SELECT coalesce(sum(t.cpus * coalesce(t.runtime_s, 0)), 0) FROM tasks t JOIN experiments e "
+            "ON e.id=t.experiment_id WHERE e.policy='manual' AND t.state=? AND t.assigned_backend='local'",
+            (PENDING,)).fetchone()[0]
+        return total + manual
 
     def remote_work_remaining(self) -> tuple[int, int]:
         """(active remote attempts, pending remote tasks)."""
@@ -641,7 +818,7 @@ class Controller:
     # ---- local admission and dispatch --------------------------------------------------------
 
     def _admit_local(self, executor: Executor, report: TickReport) -> None:
-        _, mode, _ = self.effective_profile()  # the budget profile: focus/away (auto picks one)
+        _, mode, _ = self._profile or self.effective_profile()  # the budget profile (auto picks one)
         budget = self.cfg.budgets[mode]
         gates = []
         if self.get_control("local_paused", "0") == "1":
@@ -740,13 +917,15 @@ class Controller:
         self._crashpoint("after_intent")
         try:
             ref = executor.submit(LaunchUnit(launch_id, tuple(payloads), prefix, options or {}))
-        except SubmitRejected as exc:
+        except (SubmitRejected, BackendUnreachable) as exc:  # nothing was submitted: safe to abandon now
             with db.tx(self.conn):
-                transition(self.conn, "launch", launch_id, ABANDONED, f"rejected: {exc}", self.actor)
+                transition(self.conn, "launch", launch_id, ABANDONED, f"not submitted: {exc}", self.actor)
                 for attempt_id, task, _, _ in rows:
-                    transition(self.conn, "attempt", attempt_id, ABANDONED, f"rejected by {backend}: {exc}",
+                    transition(self.conn, "attempt", attempt_id, ABANDONED, f"not submitted to {backend}: {exc}",
                                self.actor)
-                    self._task_back_to_pending(task["id"], f"submission rejected by {backend}: {exc}")
+                    self._task_back_to_pending(task["id"], f"not submitted to {backend}: {exc}")
+            if isinstance(exc, BackendUnreachable):
+                raise
             return False
         except Exception as exc:  # ambiguous: may or may not exist; reconcile resolves it by launch_id
             with db.tx(self.conn):

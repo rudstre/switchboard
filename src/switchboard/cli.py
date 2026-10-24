@@ -50,9 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(func=func)
         return p
 
-    p = add("submit", cmd_submit, "register an experiment and assign tasks to a backend")
+    p = add("submit", cmd_submit, "register an experiment; route it automatically or to one backend")
     p.add_argument("spec")
-    p.add_argument("--backend", required=True, choices=["local", "hpc"])
+    p.add_argument("--backend", required=True, choices=["auto", "local", "hpc"],
+                   help="auto: follow the spec's placement policy (default local-first); local/hpc: manual")
     p.add_argument("--tasks", help="task indices to assign, e.g. 0-99,150 (default: all)")
     p.add_argument("--new-run", action="store_true", help="start NAME#N+1 instead of refusing on identity change")
     p.add_argument("--code-id", help="pin this code identity instead of evaluating it")
@@ -63,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", required=True, choices=["local", "hpc"])
     p.add_argument("--tasks", help="indices, e.g. 100-199")
     p.add_argument("--count", type=int, help="move the last N pending tasks (the tail of the pool)")
+
+    p = add("policy", cmd_policy, "show or set an experiment's routing policy")
+    p.add_argument("experiment")
+    p.add_argument("policy", nargs="?", choices=["manual", "local-first", "local-only", "hpc-only"])
 
     p = add("cancel", cmd_cancel, "cancel a task (EXP/KEY) or all unfinished tasks of an experiment (EXP)")
     p.add_argument("target")
@@ -153,7 +158,10 @@ def cmd_submit(args) -> int:
         print(json.dumps(res.__dict__ | {"controller": kicked}))
         return 0
     verb = "would create" if res.dry_run and res.created else ("created" if res.created else "unchanged identity:")
-    print(f"{verb} {res.experiment}: {res.tasks_total} tasks, {res.tasks_assigned} assigned to {res.backend}")
+    if res.policy != "manual":
+        print(f"{verb} {res.experiment}: {res.tasks_total} tasks, routed by {res.policy}")
+    else:
+        print(f"{verb} {res.experiment}: {res.tasks_total} tasks, {res.tasks_assigned} assigned to {res.backend}")
     print(f"  code id: {short(res.code_id)}")
     for plat, env in res.env_ids.items():
         print(f"  env id [{plat}]: {short(env)}")
@@ -161,6 +169,21 @@ def cmd_submit(args) -> int:
         print(f"  warning: {w}")
     if not res.dry_run:
         print(f"  {_kick(ctl)}")
+    return 0
+
+
+def cmd_policy(args) -> int:
+    ctl = make_controller()
+    if args.policy:
+        ctl.set_policy(args.experiment, args.policy)
+        _kick(ctl)
+    exp = ctl.find_experiment(args.experiment)
+    spec = ctl._spec(exp)
+    info = {"experiment": display_name(exp["name"], exp["run_no"]), "policy": exp["policy"],
+            "max_local_wait_h": spec.placement.max_local_wait_h, "platforms": spec.placement.platforms}
+    print(json.dumps(info) if args.json else
+          f"{info['experiment']}: {info['policy']}" + (f" (max local wait {info['max_local_wait_h']:g} h)"
+                                                     if info["policy"] == "local-first" else ""))
     return 0
 
 
@@ -255,6 +278,8 @@ def cmd_status(args) -> int:
         pend = e["pending"]
         print(f"  Pending: {sum(pend.values())}" + (
             " (" + ", ".join(f"{k} {v}" for k, v in sorted(pend.items())) + ")" if pend else ""))
+        print(f"  Policy: {e['policy']}" + (f" (max local wait {e['max_local_wait_h']:g} h)"
+                                             if e["policy"] == "local-first" else ""))
         print(f"  Identity: code {short(e['code_id'])}" + "".join(
             f"   env[{p}] {short(v)}" for p, v in e["env_ids"].items()))
         for w in e["warnings"][:5]:
@@ -267,8 +292,8 @@ def cmd_status(args) -> int:
         print(f"  activity: {loc['activity']}")
     print(f"  CPU: {loc['cpus_reserved']} / {loc['cpus_budget']} threads reserved")
     print(f"  RAM: {loc['mem_gb_reserved']:.1f} / {loc['mem_gb_budget']:g} GB reserved")
-    print()
-    print("Policy: manual (switchboard submit/assign --backend); automatic routing arrives in M6")
+    if loc["drain_s"] is not None:
+        print(f"  Mac queue: ~{loc['drain_s'] / 3600:.1f} h of declared work at this budget")
     return 0
 
 
@@ -280,6 +305,7 @@ def cmd_explain(args) -> int:
     data = {
         "task": f"{display_name(exp['name'], exp['run_no'])}/{task['key']}",
         "state": task["state"], "assigned_backend": task["assigned_backend"], "note": task["note"],
+        "routing": task["route_note"], "policy": exp["policy"],
         "params": json.loads(task["params_json"]), "seed": task["seed"],
         "reservation": {"cpus": task["cpus"], "mem_mb": task["mem_mb"]},
         "retries_used": task["retries_used"], "accepted_attempt_id": task["accepted_attempt_id"],
@@ -293,6 +319,8 @@ def cmd_explain(args) -> int:
     print(f"  params: {task['params_json']}  seed: {task['seed']}")
     print(f"  backend: {task['assigned_backend'] or 'unassigned'}   reservation: {task['cpus']} cpus, "
           f"{task['mem_mb'] / 1024:.1f} GB   retries used: {task['retries_used']}")
+    if task["route_note"]:
+        print(f"  routing: {task['route_note']}")
     print(f"  why: {task['note']}")
     for a in attempts:
         mark = "  <- accepted" if a["id"] == task["accepted_attempt_id"] else ""
@@ -492,7 +520,8 @@ def _exp_status(ctl: Controller, exp) -> dict:
     return {
         "name": display_name(exp["name"], exp["run_no"]), "tasks": sum(counts.values()), "counts": counts,
         "running": by_backend["RUNNING"], "submitted": by_backend["SUBMITTED"], "pending": pending,
-        "code_id": exp["code_id"], "env_ids": ctl.experiment_envs(exp["id"]),
+        "code_id": exp["code_id"], "env_ids": ctl.experiment_envs(exp["id"]), "policy": exp["policy"],
+        "max_local_wait_h": ctl._spec(exp).placement.max_local_wait_h,
         "warnings": ctl.usage_warnings(exp["id"]),
     }
 
@@ -506,7 +535,9 @@ def _local_status(ctl: Controller) -> dict:
     cpus, mem = ctl.conn.execute(
         f"SELECT coalesce(sum(t.cpus),0), coalesce(sum(t.mem_mb),0) FROM attempts a JOIN tasks t ON t.id=a.task_id "
         f"WHERE a.backend='local' AND a.state IN {ACTIVE_SQL}").fetchone()
+    drain = ctl.get_control("local_drain_s", "")
     return {"mode": mode, "profile": profile, "activity": snap.reason if mode == "auto" else None,
+            "drain_s": float(drain) if drain else None,
             "paused": ctl.get_control("local_paused", "0") == "1", "cpus_reserved": cpus,
             "cpus_budget": budget.cpus, "mem_gb_reserved": mem / 1024, "mem_gb_budget": budget.mem_gb}
 

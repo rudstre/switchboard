@@ -8,11 +8,16 @@ from importlib import resources
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 # Upgrade steps from version N to N+1 (applied in order to existing databases).
 UPGRADES = {
     1: ["ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"],
+    2: ["ALTER TABLE experiments ADD COLUMN policy TEXT NOT NULL DEFAULT 'manual'",
+        "CREATE TABLE IF NOT EXISTS experiment_backends (experiment_id INTEGER NOT NULL REFERENCES experiments(id), "
+        "backend TEXT NOT NULL, ok INTEGER NOT NULL, detail TEXT, checked_at REAL NOT NULL, "
+        "PRIMARY KEY (experiment_id, backend))"],
+    3: ["ALTER TABLE tasks ADD COLUMN route_note TEXT"],
 }
 
 
