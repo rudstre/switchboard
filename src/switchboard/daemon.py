@@ -16,10 +16,13 @@ import os
 import select
 import signal
 import socket
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Callable
 
+from . import macos
 from .config import Config
 from .controller import Controller
 
@@ -30,10 +33,51 @@ class DaemonAlreadyRunning(RuntimeError):
     pass
 
 
+class KeepAwake:
+    """Hold a `caffeinate -i` idle-sleep assertion while wanted. `-w <our pid>` makes caffeinate exit if
+    the daemon dies, so the assertion can never outlive it. Lid-close sleep is not prevented."""
+
+    def __init__(self, command: tuple[str, ...] = ("caffeinate", "-i"), tie_to_pid: bool = True) -> None:
+        self.command = command
+        self.tie_to_pid = tie_to_pid
+        self.proc: subprocess.Popen | None = None
+
+    @property
+    def held(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def update(self, want: bool) -> None:
+        if want and not self.held:
+            argv = [*self.command, *(["-w", str(os.getpid())] if self.tie_to_pid else [])]
+            try:
+                self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+                log.info("holding idle-sleep assertion while local tasks run")
+            except OSError as exc:
+                log.warning("cannot prevent idle sleep: %s", exc)
+                self.proc = None
+        elif not want and self.held:
+            self.stop()
+            log.info("released idle-sleep assertion")
+
+    def stop(self) -> None:
+        if self.held:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+
+
 class Daemon:
-    def __init__(self, cfg: Config, make_controller: Callable[[], Controller]) -> None:
+    def __init__(self, cfg: Config, make_controller: Callable[[], Controller], keep_awake: KeepAwake | None = None,
+                 on_ac: Callable[[], bool] | None = None) -> None:
         self.cfg = cfg
         self.make_controller = make_controller
+        use = cfg.local.prevent_idle_sleep and sys.platform == "darwin"
+        self.keep_awake = keep_awake if keep_awake is not None else (KeepAwake() if use else None)
+        self.on_ac = on_ac or (lambda: macos.on_battery() is False)
         self.ticks = 0
         self.nudges = 0
         self._stop = False
@@ -64,6 +108,8 @@ class Daemon:
         try:
             self._loop(sock, wake_r, max_ticks)
         finally:
+            if self.keep_awake is not None:
+                self.keep_awake.stop()
             signal.set_wakeup_fd(old_wakeup)
             for s, handler in previous.items():
                 signal.signal(s, handler)
@@ -91,6 +137,8 @@ class Daemon:
                     last_remote, self._force_remote = time.monotonic(), False
                 active, pending = ctl.local_work_remaining()
                 busy = bool(active or pending)
+                if self.keep_awake is not None:
+                    self.keep_awake.update(active > 0 and self.on_ac())
                 r_active, r_pending = ctl.remote_work_remaining()
                 remote_busy = bool(r_active or r_pending)
                 failures = 0

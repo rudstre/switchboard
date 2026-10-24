@@ -98,8 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("results", cmd_results, "accepted result per task (use this instead of globbing directories)")
     p.add_argument("experiment")
 
-    p = add("mode", cmd_mode, "show or set the local budget profile")
-    p.add_argument("mode", nargs="?")
+    p = add("mode", cmd_mode, "show the activity-driven profile, or set auto|focus|away")
+    p.add_argument("mode", nargs="?", help="auto (follow activity), focus or away")
     p = add("pause-local", cmd_pause, "stop admitting new local tasks (running tasks continue)")
     p.add_argument("--suspend", action="store_true",
                    help="also SIGSTOP running local tasks (frees CPU, not memory)")
@@ -112,7 +112,8 @@ def make_controller(actor: str = "cli", cfg: Config | None = None) -> Controller
     executors = {"local": PueueExecutor(cfg.launch_dir, cfg.local)}
     if cfg.hpc.host:
         executors["hpc"] = make_slurm(cfg)
-    return Controller(cfg, executors, actor=actor, gates=local_gates(cfg))
+    sensor = macos.MacSensors() if sys.platform == "darwin" else None
+    return Controller(cfg, executors, actor=actor, gates=local_gates(cfg), activity_sensor=sensor)
 
 
 def make_slurm(cfg: Config) -> SlurmExecutor:
@@ -260,7 +261,10 @@ def cmd_status(args) -> int:
             print(f"  warning: {w}")
         print()
     loc = data["local"]
-    print(f"Local budget ({loc['mode']}{', PAUSED' if loc['paused'] else ''}):")
+    label = f"auto -> {loc['profile']}" if loc["mode"] == "auto" else loc["mode"]
+    print(f"Local budget ({label}{', PAUSED' if loc['paused'] else ''}):")
+    if loc["activity"]:
+        print(f"  activity: {loc['activity']}")
     print(f"  CPU: {loc['cpus_reserved']} / {loc['cpus_budget']} threads reserved")
     print(f"  RAM: {loc['mem_gb_reserved']:.1f} / {loc['mem_gb_budget']:g} GB reserved")
     print()
@@ -321,8 +325,27 @@ def cmd_mode(args) -> int:
     if args.mode:
         ctl.set_mode(args.mode)
         _kick(ctl)
-    mode = ctl.get_control("mode", "focus")
-    print(json.dumps({"mode": mode}) if args.json else f"mode: {mode}")
+    mode, profile, reason = ctl.effective_profile()
+    sample = ctl.activity_sensor(ctl.local_work_remaining()[0] > 0) if ctl.activity_sensor else None
+    budget = ctl.cfg.budgets[profile]
+    if args.json:
+        print(json.dumps({"mode": mode, "profile": profile, "reason": reason,
+                          "budget": {"cpus": budget.cpus, "mem_gb": budget.mem_gb},
+                          "sensors": sample.__dict__ if sample else None}))
+        return 0
+    print(f"mode: {mode}" + (f" -> {profile} ({budget.cpus} cpus, {budget.mem_gb:g} GB)" if mode == "auto" else
+                             f" ({budget.cpus} cpus, {budget.mem_gb:g} GB)"))
+    print(f"  why: {reason}")
+    if sample:
+        idle = f"{sample.idle_s:.0f}s" if sample.idle_s is not None else "unknown"
+        cpu = f"{sample.foreign_cores:.1f} cores" if sample.foreign_cores is not None else "not sampled yet"
+        print(f"  input idle {idle}; screen {'locked' if sample.screen_locked else 'unlocked'}; display "
+              f"{'asleep' if sample.display_asleep else 'on'}; other CPU load {cpu}")
+        ignored = set(ctl.cfg.activity.ignore_holders)
+        for label, holders in (("display awake", sample.display_holders), ("microphone", sample.microphone_holders)):
+            if holders:
+                marks = [f"{h} (ignored)" if h in ignored else h for h in holders]
+                print(f"  {label}: {', '.join(marks)}")
     return 0
 
 
@@ -475,12 +498,16 @@ def _exp_status(ctl: Controller, exp) -> dict:
 
 
 def _local_status(ctl: Controller) -> dict:
-    mode = ctl.get_control("mode", "focus")
-    budget = ctl.cfg.budgets[mode]
+    mode = ctl.get_control("mode", "auto")
+    snap = ctl.activity_snapshot()
+    from .activity import PROFILE
+    profile = PROFILE[snap.state] if mode == "auto" else mode
+    budget = ctl.cfg.budgets[profile]
     cpus, mem = ctl.conn.execute(
         f"SELECT coalesce(sum(t.cpus),0), coalesce(sum(t.mem_mb),0) FROM attempts a JOIN tasks t ON t.id=a.task_id "
         f"WHERE a.backend='local' AND a.state IN {ACTIVE_SQL}").fetchone()
-    return {"mode": mode, "paused": ctl.get_control("local_paused", "0") == "1", "cpus_reserved": cpus,
+    return {"mode": mode, "profile": profile, "activity": snap.reason if mode == "auto" else None,
+            "paused": ctl.get_control("local_paused", "0") == "1", "cpus_reserved": cpus,
             "cpus_budget": budget.cpus, "mem_gb_reserved": mem / 1024, "mem_gb_budget": budget.mem_gb}
 
 

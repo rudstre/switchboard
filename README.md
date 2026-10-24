@@ -9,18 +9,14 @@ A repository-agnostic controller for research jobs.
   - **at most one accepted result per task**;
   - no silent reuse of results when code or environments change.
 
-**Status:** MVP complete (M0–M4).
+**Status:** M0–M5.
 - M0 + M1: core model, runner shim, responsiveness benchmark.
 - M2: Pueue execution, gates, adaptive daemon.
 - M3: Slurm arrays over SSH; smoke-tested on the SWC cluster.
 - M4: manual mixed routing, cancel, retry, logs.
+- M5: activity detection and `mode auto`.
 
-Coming next:
-
-| Milestone | Adds |
-|---|---|
-| M5 | Activity detection and `mode auto` |
-| M6 | Local-first routing with HPC overflow |
+Coming next: M6, local-first routing with HPC overflow.
 
 ## Quick start
 
@@ -69,6 +65,23 @@ Assigning a task to a backend pins the code and environment identity there first
 - `pause-local --suspend` SIGSTOPs running tasks, which frees CPU but not memory.
 - A task killed by a Pueue restart, a reboot or a manual kill is requeued without using a retry, up to 3 times.
 
+**Activity (`mode auto`, the default):**
+
+`switchboard mode` shows the chosen profile, why it was chosen, and the live sensor readings. `switchboard mode focus|away` overrides; `switchboard mode auto` goes back to following activity.
+
+The `focus` budget applies immediately when any of these holds:
+- you used the keyboard or trackpad in the last 2 minutes;
+- an app keeps the display awake (video, presentation) or is using the microphone (calls);
+- other work is using more than 3 cores, which is protected even if you are away.
+
+The `away` budget applies only after away evidence has held for 2 minutes. Away evidence is either:
+- the screen is locked or the display is asleep; or
+- there has been no input for 10 minutes, nothing holds the display or microphone, and the CPU is quiet.
+
+Not typing, on its own, never counts as away. `corespeechd` ("Hey Siri") is ignored as a microphone user, and more processes can be ignored with `[activity] ignore_holders`.
+
+While local tasks run on AC power, the daemon holds a `caffeinate -i` assertion so idle sleep doesn't freeze them. Closing the lid still sleeps the Mac. Turn this off with `[local] prevent_idle_sleep = false`.
+
 - **State location:** `~/.switchboard/` (override with `SWITCHBOARD_HOME`).
 - **Config:** `~/.config/switchboard/config.toml` (override with `SWITCHBOARD_CONFIG`), for example:
 
@@ -91,6 +104,14 @@ memory_pressure_gate = true
 [daemon]
 local_interval_s = 5
 idle_interval_s = 300
+
+[activity]                              # mode auto thresholds (defaults shown)
+active_idle_s = 120
+away_idle_s = 600
+away_hold_s = 120
+busy_cores = 3.0
+quiet_cores = 1.0
+ignore_holders = []                     # added to the built-in ["corespeechd"]
 ```
 
 ## Cluster (Slurm over SSH)
@@ -167,7 +188,8 @@ See [examples/synthetic-grid.yaml](examples/synthetic-grid.yaml). The sections a
 | `executors/` | executor protocol; `pueue.py` (local, Pueue 4.x); `slurm.py` + `transport.py` (SSH); `fake.py` test double |
 | `export.py` | registry-free, self-contained Slurm launch directories |
 | `tools/mock_slurm/` | sbatch/squeue/sacct/scancel/scontrol/sacctmgr stand-ins with fault injection (tests) |
-| `macos.py` | memory-pressure and power readings, and the admission gates built on them |
+| `macos.py` | memory pressure, power, idle time, lock/display state, assertion holders, foreign CPU |
+| `activity.py` | pure activity classifier with hysteresis (ACTIVE -> focus, AWAY -> away) |
 | `daemon.py`, `launchd.py` | adaptive background loop with nudge socket and lock; LaunchAgent install |
 | `controller.py` | submit/assign with identity pinning, reconcile, acceptance CAS, admission |
 | `policy.py` | pure static-budget admission |

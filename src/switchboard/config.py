@@ -8,6 +8,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .activity import ActivityConfig
+
 # macOS limits AF_UNIX socket paths to 104 bytes (SUN_LEN).
 MAX_SOCKET_PATH = 100
 
@@ -45,6 +47,9 @@ class LocalConfig:
     pueue_parallel: int = 64
     run_on_battery: bool = False
     memory_pressure_gate: bool = True
+    # While local tasks run on AC power, hold a `caffeinate -i` assertion so idle sleep does not
+    # freeze them. Closing the lid still sleeps the Mac.
+    prevent_idle_sleep: bool = True
 
 
 @dataclass(frozen=True)
@@ -72,6 +77,7 @@ class Config:
     local: LocalConfig = field(default_factory=LocalConfig)
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     hpc: HpcConfig = field(default_factory=HpcConfig)
+    activity: ActivityConfig = field(default_factory=ActivityConfig)
     # Seconds a SUBMITTING launch must be positively absent before it is ABANDONED.
     submit_grace_s: float = 120.0
     # Seconds an attempt may be missing from its backend (with no final status) before it is LOST.
@@ -139,7 +145,9 @@ def load_config(path: Path | None = None, home: Path | None = None) -> Config:
             pueue_parallel=int(local.get("pueue_parallel", defaults.pueue_parallel)),
             run_on_battery=bool(local.get("run_on_battery", defaults.run_on_battery)),
             memory_pressure_gate=bool(local.get("memory_pressure_gate", defaults.memory_pressure_gate)),
+            prevent_idle_sleep=bool(local.get("prevent_idle_sleep", defaults.prevent_idle_sleep)),
         ),
+        activity=_activity(raw.get("activity", {})),
         daemon=DaemonConfig(
             local_interval_s=float(daemon.get("local_interval_s", 5.0)),
             idle_interval_s=float(daemon.get("idle_interval_s", 300.0)),
@@ -148,4 +156,17 @@ def load_config(path: Path | None = None, home: Path | None = None) -> Config:
                          for k, v in raw.get("hpc", {}).items() if k in HpcConfig.__dataclass_fields__}),
         submit_grace_s=float(controller.get("submit_grace_s", 120.0)),
         lost_grace_s=float(controller.get("lost_grace_s", 300.0)),
+    )
+
+
+def _activity(raw: dict) -> ActivityConfig:
+    d = ActivityConfig()
+    return ActivityConfig(
+        active_idle_s=float(raw.get("active_idle_s", d.active_idle_s)),
+        away_idle_s=float(raw.get("away_idle_s", d.away_idle_s)),
+        away_hold_s=float(raw.get("away_hold_s", d.away_hold_s)),
+        busy_cores=float(raw.get("busy_cores", d.busy_cores)),
+        quiet_cores=float(raw.get("quiet_cores", d.quiet_cores)),
+        use_microphone=bool(raw.get("use_microphone", d.use_microphone)),
+        ignore_holders=tuple(d.ignore_holders) + tuple(raw.get("ignore_holders", ())),
     )

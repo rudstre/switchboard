@@ -21,6 +21,7 @@ from typing import Any
 import psutil
 
 from . import policy
+from .activity import PROFILE, ActivityState, classify
 from .config import Config
 from .executors.base import (
     AttemptPayload,
@@ -109,6 +110,7 @@ class Controller:
         crashpoints: set[str] | None = None,
         gates: list | None = None,
         clock=time.time,
+        activity_sensor=None,
     ) -> None:
         self.cfg = config
         self.executors = executors
@@ -118,6 +120,8 @@ class Controller:
         # Callables returning a reason string when new local admissions must stop (M2: pressure, battery).
         self.gates = gates or []
         self.clock = clock
+        # Callable(local_tasks_running) -> activity.Sample; drives `mode auto`. None: no sensors.
+        self.activity_sensor = activity_sensor
         self._specs: dict[int, ExperimentSpec] = {}
 
     # ==== submission ===========================================================================
@@ -637,7 +641,7 @@ class Controller:
     # ---- local admission and dispatch --------------------------------------------------------
 
     def _admit_local(self, executor: Executor, report: TickReport) -> None:
-        mode = self.get_control("mode", "focus")
+        _, mode, _ = self.effective_profile()  # the budget profile: focus/away (auto picks one)
         budget = self.cfg.budgets[mode]
         gates = []
         if self.get_control("local_paused", "0") == "1":
@@ -773,9 +777,31 @@ class Controller:
             log_event(self.conn, "control", key, old or None, value, f"{key} set to {value}", self.actor)
 
     def set_mode(self, mode: str) -> None:
-        if mode not in self.cfg.budgets:
-            raise SwitchboardError(f"unknown mode '{mode}'; configured: {sorted(self.cfg.budgets)}")
+        if mode != "auto" and mode not in self.cfg.budgets:
+            raise SwitchboardError(f"unknown mode '{mode}'; use auto or one of {sorted(self.cfg.budgets)}")
         self.set_control("mode", mode)
+
+    def effective_profile(self) -> tuple[str, str, str]:
+        """(mode, budget profile, reason). `auto` samples the activity sensors and applies hysteresis."""
+        mode = self.get_control("mode", "auto")
+        if mode != "auto":
+            return mode, mode, "set manually (switchboard mode auto to follow activity)"
+        if self.activity_sensor is None:
+            return mode, "focus", "no activity sensors available; using focus"
+        prev = self.activity_snapshot()
+        sample = self.activity_sensor(self.local_work_remaining()[0] > 0)
+        new = classify(prev, sample, self.cfg.activity)
+        if new != prev:
+            with db.tx(self.conn):
+                self.conn.execute("INSERT INTO control(key, value) VALUES ('activity', ?) "
+                                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(new.to_dict()),))
+                if new.state != prev.state:
+                    log_event(self.conn, "control", "activity", prev.state, new.state, new.reason, self.actor)
+        return mode, PROFILE[new.state], new.reason
+
+    def activity_snapshot(self) -> ActivityState:
+        raw = self.get_control("activity", "")
+        return ActivityState.from_dict(json.loads(raw)) if raw else ActivityState()
 
     def experiments(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM experiments ORDER BY created_at").fetchall()

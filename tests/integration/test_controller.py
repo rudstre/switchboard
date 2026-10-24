@@ -288,3 +288,100 @@ def test_underestimated_memory_is_flagged_not_killed(controller, executor, write
     assert task_states(controller) == {0: "SUCCEEDED"}
     warnings = controller.usage_warnings(controller.find_experiment("exp")["id"])
     assert any("exceeded its 103 MB reservation" in w for w in warnings)
+
+
+# ---- M5: mode auto ------------------------------------------------------------------------------
+
+
+class FakeSensor:
+    def __init__(self, **kw):
+        self.kw = kw
+        self.t = 1000.0
+
+    def __call__(self, local_tasks_running):
+        from switchboard.activity import Sample
+        self.t += 30
+        return Sample(t=self.t, **self.kw)
+
+
+def test_auto_mode_switches_budget_within_one_tick(cfg, executor, write_spec):
+    sensor = FakeSensor(idle_s=1.0)
+    ctl = Controller(cfg, {"local": executor}, activity_sensor=sensor)  # cfg: focus 4 cpus, away 8 cpus
+    ctl.submit(write_spec(task_args=["--seconds", "3"], params={"grid": {"alpha": list(range(8))}, "seeds": [1]},
+                          resources={"cpus": 1, "mem_gb": 0.5}), "local")
+    assert ctl.tick().admitted == 4
+    assert ctl.effective_profile()[1] == "focus"
+    sensor.kw = {"screen_locked": True}
+    ctl.tick()  # away evidence starts the hold timer
+    for _ in range(4):  # 4 x 30 s of fake time > 120 s hold
+        ctl.effective_profile()
+    assert ctl.effective_profile()[1] == "away"
+    assert ctl.tick().admitted == 4  # the next tick uses the away budget (8 cpus)
+    events = ctl.conn.execute("SELECT from_state, to_state FROM events WHERE entity='control' "
+                              "AND entity_id='activity'").fetchall()
+    assert [(e[0], e[1]) for e in events] == [("ACTIVE", "AWAY")]
+    sensor.kw = {"idle_s": 0.1}
+    assert ctl.effective_profile()[1] == "focus"  # back immediately on input
+    drive(ctl, executor)
+
+
+def test_hysteresis_state_survives_a_controller_restart(cfg, executor):
+    sensor = FakeSensor(screen_locked=True)
+    first = Controller(cfg, {"local": executor}, activity_sensor=sensor)
+    for _ in range(3):
+        first.effective_profile()  # 90 s of away evidence
+    second = Controller(cfg, {"local": executor}, activity_sensor=sensor)
+    second.effective_profile()  # +30 s: the hold (120 s) completes only if the timer was persisted
+    assert second.effective_profile()[1] == "away"
+
+
+def test_manual_mode_overrides_activity(cfg, executor):
+    ctl = Controller(cfg, {"local": executor}, activity_sensor=FakeSensor(screen_locked=True))
+    ctl.set_mode("focus")
+    for _ in range(10):
+        assert ctl.effective_profile()[1] == "focus"
+    ctl.set_mode("auto")
+    assert ctl.effective_profile()[0] == "auto"
+
+
+def test_keep_awake_is_held_only_while_wanted():
+    import sys
+    from switchboard.daemon import KeepAwake
+    k = KeepAwake(command=(sys.executable, "-c", "import time; time.sleep(60)"), tie_to_pid=False)
+    k.update(False)
+    assert not k.held
+    k.update(True)
+    first = k.proc.pid
+    k.update(True)
+    assert k.held and k.proc.pid == first  # not restarted while held
+    k.update(False)
+    assert not k.held
+    k.update(True)
+    k.stop()
+    assert not k.held
+
+
+def test_daemon_requests_keep_awake_only_for_running_local_work_on_ac(cfg, executor, write_spec):
+    from switchboard.daemon import Daemon, KeepAwake
+
+    class Recorder(KeepAwake):
+        def __init__(self):
+            super().__init__()
+            self.wants = []
+
+        def update(self, want):
+            self.wants.append(want)
+
+        def stop(self):
+            pass
+
+    ctl = Controller(cfg, {"local": executor})
+    ctl.submit(write_spec(task_args=["--seconds", "2"], params={"grid": {"alpha": [1]}, "seeds": [1]}), "local")
+    for on_ac, expected in ((True, True), (False, False)):
+        rec = Recorder()
+        Daemon(cfg, lambda: ctl, keep_awake=rec, on_ac=lambda on_ac=on_ac: on_ac).run(max_ticks=1)
+        assert rec.wants == [expected]
+    drive(ctl, executor)
+    rec = Recorder()
+    Daemon(cfg, lambda: ctl, keep_awake=rec, on_ac=lambda: True).run(max_ticks=1)
+    assert rec.wants == [False]  # nothing running locally: let the Mac sleep
