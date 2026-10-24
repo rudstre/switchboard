@@ -1,0 +1,172 @@
+[
+ {
+  "prefix": "-",
+  "threads": 0,
+  "jitter_p50_ms": 0.508374978788197,
+  "jitter_p99_ms": 1.1311660422943532,
+  "py_start_ms": 14.205833023879677,
+  "git_status_ms": 14.312957995571196,
+  "samples": 699,
+  "units_per_s": null
+ },
+ {
+  "prefix": "default",
+  "threads": 4,
+  "jitter_p50_ms": 0.51091702375561,
+  "jitter_p99_ms": 1.1462910119444132,
+  "py_start_ms": 15.994957997463644,
+  "git_status_ms": 15.903958497801796,
+  "samples": 624,
+  "units_per_s": 12201.138405950907
+ },
+ {
+  "prefix": "nice",
+  "threads": 4,
+  "jitter_p50_ms": 0.5110000278800726,
+  "jitter_p99_ms": 1.1506249797530472,
+  "py_start_ms": 16.100895503768697,
+  "git_status_ms": 15.966063016094267,
+  "samples": 620,
+  "units_per_s": 12199.431805468239
+ },
+ {
+  "prefix": "background",
+  "threads": 4,
+  "jitter_p50_ms": 0.5070419651456177,
+  "jitter_p99_ms": 1.1386660411953926,
+  "py_start_ms": 14.466958498815075,
+  "git_status_ms": 14.373624959262088,
+  "samples": 686,
+  "units_per_s": 4559.047861142348
+ },
+ {
+  "prefix": "utility",
+  "threads": 4,
+  "jitter_p50_ms": 0.5097079924307764,
+  "jitter_p99_ms": 1.1625840347260237,
+  "py_start_ms": 15.350000001490116,
+  "git_status_ms": 15.322832972742617,
+  "samples": 645,
+  "units_per_s": 11996.442661669695
+ },
+ {
+  "prefix": "default",
+  "threads": 8,
+  "jitter_p50_ms": 0.5111659779213369,
+  "jitter_p99_ms": 1.2369170221500099,
+  "py_start_ms": 16.99174998793751,
+  "git_status_ms": 18.752667005173862,
+  "samples": 555,
+  "units_per_s": 24623.64204578791
+ },
+ {
+  "prefix": "nice",
+  "threads": 8,
+  "jitter_p50_ms": 0.511249971576035,
+  "jitter_p99_ms": 1.2829579431563616,
+  "py_start_ms": 16.983042005449533,
+  "git_status_ms": 18.563165969680995,
+  "samples": 557,
+  "units_per_s": 24583.86798404802
+ },
+ {
+  "prefix": "background",
+  "threads": 8,
+  "jitter_p50_ms": 0.506959019228816,
+  "jitter_p99_ms": 1.1340830028057098,
+  "py_start_ms": 14.757625001948327,
+  "git_status_ms": 14.617207983974367,
+  "samples": 669,
+  "units_per_s": 4960.294975021168
+ },
+ {
+  "prefix": "utility",
+  "threads": 8,
+  "jitter_p50_ms": 0.5074589648284018,
+  "jitter_p99_ms": 1.1222919933497906,
+  "py_start_ms": 14.975707978010178,
+  "git_status_ms": 14.93316696723923,
+  "samples": 663,
+  "units_per_s": 16247.102357716725
+ },
+ {
+  "prefix": "default",
+  "threads": 10,
+  "jitter_p50_ms": 0.51016701804474,
+  "jitter_p99_ms": 1.5435419995337725,
+  "py_start_ms": 16.918083012569696,
+  "git_status_ms": 18.37570796487853,
+  "samples": 555,
+  "units_per_s": 30629.07378322572
+ },
+ {
+  "prefix": "nice",
+  "threads": 10,
+  "jitter_p50_ms": 0.5097919860854745,
+  "jitter_p99_ms": 1.6080830032005906,
+  "py_start_ms": 16.86112495372072,
+  "git_status_ms": 18.54025002103299,
+  "samples": 555,
+  "units_per_s": 30570.354980329113
+ },
+ {
+  "prefix": "background",
+  "threads": 10,
+  "jitter_p50_ms": 0.508374978788197,
+  "jitter_p99_ms": 1.191000025253743,
+  "py_start_ms": 15.021125029306859,
+  "git_status_ms": 14.946292038075626,
+  "samples": 629,
+  "units_per_s": 5226.658636982418
+ },
+ {
+  "prefix": "utility",
+  "threads": 10,
+  "jitter_p50_ms": 0.5078750331886113,
+  "jitter_p99_ms": 1.1727079767733812,
+  "py_start_ms": 15.232542005833238,
+  "git_status_ms": 15.096459013875574,
+  "samples": 629,
+  "units_per_s": 10715.792592104306
+ },
+ {
+  "prefix": "default",
+  "threads": 12,
+  "jitter_p50_ms": 0.5117080076597631,
+  "jitter_p99_ms": 2.412250011228025,
+  "py_start_ms": 18.9123330055736,
+  "git_status_ms": 21.453791996464133,
+  "samples": 481,
+  "units_per_s": 35808.40917897435
+ },
+ {
+  "prefix": "nice",
+  "threads": 12,
+  "jitter_p50_ms": 0.5109999696724117,
+  "jitter_p99_ms": 2.0100839687511325,
+  "py_start_ms": 18.234207993373275,
+  "git_status_ms": 20.234833005815744,
+  "samples": 505,
+  "units_per_s": 35544.25805896691
+ },
+ {
+  "prefix": "background",
+  "threads": 12,
+  "jitter_p50_ms": 0.5080000050365925,
+  "jitter_p99_ms": 1.1948329997248948,
+  "py_start_ms": 14.807958476012573,
+  "git_status_ms": 14.721583022037521,
+  "samples": 652,
+  "units_per_s": 4647.984564736471
+ },
+ {
+  "prefix": "utility",
+  "threads": 12,
+  "jitter_p50_ms": 0.5071249692700803,
+  "jitter_p99_ms": 1.167874994687736,
+  "py_start_ms": 14.659958949778229,
+  "git_status_ms": 14.43937502335757,
+  "samples": 675,
+  "units_per_s": 11159.090316043103
+ }
+]

@@ -1,0 +1,16 @@
+# A synthetic experiment: 6 x 2 = 12 tasks that burn CPU briefly and write one output each.
+# Local paths are relative to this spec file; adjust backends.* for real use.
+experiment: synthetic-grid
+command: ["python3", "tools/synth.py", "task", "--threads", "1", "--seconds", "1",
+          "--seed", "{seed}", "--outdir", "{outdir}", "--write", "result.json"]
+params:
+  grid: {alpha: {linspace: [0, 1, 6]}}
+  seeds: [1, 2]
+resources: {cpus: 1, mem_gb: 0.5, runtime_min: 1}
+outputs: {expect: ["result.json"]}
+identity:
+  code: {command: "python3 -c 'import hashlib,sys;sys.stdout.write(hashlib.sha256(open(\"tools/synth.py\",\"rb\").read()).hexdigest())'"}
+  env: {command: "python3 -VV"}
+retries: {max: 1, on: [nonzero, lost, runner_died]}
+backends:
+  local: {workdir: .., output_root: ../sb-out}   # relative to this file

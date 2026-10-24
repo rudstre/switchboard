@@ -1,0 +1,34 @@
+[project]
+name = "switchboard"
+version = "0.1.0"
+description = "Repository-agnostic controller that routes research tasks between a Mac (Pueue) and an HPC cluster (Slurm)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6",
+    "psutil>=5.9",
+]
+
+[project.scripts]
+switchboard = "switchboard.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/switchboard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "pueue: needs a running pueued (M2)",
+    "macos: needs macOS system utilities",
+    "cluster: talks to the real HPC cluster; never run automatically",
+    "slow: takes more than a few seconds",
+]
+addopts = "-m 'not cluster'"
