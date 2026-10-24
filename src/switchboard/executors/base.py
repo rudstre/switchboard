@@ -96,6 +96,16 @@ class LocalStatusReader:
         p = Path(os.path.expandvars(path)).expanduser()
         return str(p if p.is_absolute() else (Path(spec_dir) / p).resolve())
 
+    def read_text(self, paths: list[str], max_bytes: int = 1 << 20) -> dict[str, str | None]:
+        out: dict[str, str | None] = {}
+        for path in paths:
+            try:
+                with open(path, "rb") as fh:
+                    out[path] = fh.read(max_bytes).decode("utf-8", "replace")
+            except OSError:
+                out[path] = None
+        return out
+
     def read_status(self, attempt_dirs: dict[str, str]) -> dict[str, dict | None]:
         out: dict[str, dict | None] = {}
         for attempt_id, attempt_dir in attempt_dirs.items():

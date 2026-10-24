@@ -109,7 +109,10 @@ class FakeExecutor(LocalStatusReader):
         for t in tracked:
             proc = self.jobs.get(t.external_id or "", {}).get("procs", {}).get(t.attempt_id)
             if proc is not None and proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass  # exited meanwhile (macOS reports EPERM for a group whose leader just exited)
 
     # -- test helpers --------------------------------------------------------------------------
 

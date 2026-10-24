@@ -243,6 +243,9 @@ class SlurmExecutor:
     def launch_dir(self, launch_id: str) -> str:
         return self.resolve_path(f"{self.cfg.remote_root}/launch/{launch_id}")
 
+    def element_log(self, launch_id: str, array_job_id: str, idx: int) -> str:
+        return f"{self.launch_dir(launch_id)}/slurm-{array_job_id}_{idx}.out"
+
     # -- setup / limits --------------------------------------------------------------------------
 
     def ensure_runner(self) -> str:
@@ -370,6 +373,12 @@ class SlurmExecutor:
             except json.JSONDecodeError:
                 out[aid] = None
         return out
+
+    def read_text(self, paths: list[str], max_bytes: int = 1 << 20) -> dict[str, str | None]:
+        try:
+            return self.transport.read_files(paths, max_bytes=max_bytes)
+        except (TransportDown, TransportLost) as exc:
+            raise BackendUnreachable(str(exc)) from exc
 
     def cancel(self, tracked: Sequence[Tracked]) -> None:
         ids = [f"{t.external_id}_{t.array_idx or 0}" for t in tracked if t.external_id]

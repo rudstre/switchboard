@@ -9,17 +9,17 @@ A repository-agnostic controller for research jobs.
   - **at most one accepted result per task**;
   - no silent reuse of results when code or environments change.
 
-**Status:** M0–M3.
+**Status:** MVP complete (M0–M4).
 - M0 + M1: core model, runner shim, responsiveness benchmark.
 - M2: Pueue execution, gates, adaptive daemon.
-- M3: Slurm arrays over SSH. Tested against a mock cluster; not yet run on the real one (see [docs/m3-cluster-checklist.md](docs/m3-cluster-checklist.md)).
+- M3: Slurm arrays over SSH; smoke-tested on the SWC cluster.
+- M4: manual mixed routing, cancel, retry, logs.
 
 Coming next:
 
 | Milestone | Adds |
 |---|---|
-| M4 | Mixed routing and the rest of the CLI |
-| M5 | Activity detection |
+| M5 | Activity detection and `mode auto` |
 | M6 | Local-first routing with HPC overflow |
 
 ## Quick start
@@ -34,6 +34,26 @@ uv run switchboard status
 uv run switchboard explain synthetic-grid/3
 uv run switchboard results synthetic-grid --json
 ```
+
+**Splitting one experiment by hand:**
+
+```bash
+switchboard submit grid.yaml --backend local            # every task starts in the Mac's pool
+switchboard assign grid --backend hpc --count 120       # move the last 120 pending tasks to the cluster
+switchboard assign grid --backend local --tasks 150-159 # or move specific pending tasks back
+```
+
+**Watching and managing tasks:**
+
+```bash
+switchboard status grid
+switchboard explain grid/42                             # routing, admission reason, attempt history
+switchboard logs grid/42                                # stdout/stderr (+ Slurm's log), local or over SSH
+switchboard cancel grid/42                              # or `cancel grid` for every unfinished task
+switchboard retry grid --failed-only                    # requeue with a fresh retry budget
+```
+
+Assigning a task to a backend pins the code and environment identity there first, and refuses on a mismatch. Tasks never move once dispatched.
 
 - **Without the daemon:** each command runs one controller pass inline, and `switchboard run` ticks in the foreground until local work is done.
 - **With the daemon:** commands nudge it.

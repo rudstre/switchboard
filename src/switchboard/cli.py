@@ -58,10 +58,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--code-id", help="pin this code identity instead of evaluating it")
     p.add_argument("--dry-run", action="store_true")
 
-    p = add("assign", cmd_assign, "assign pending tasks of an experiment to a backend")
+    p = add("assign", cmd_assign, "assign pending tasks of an experiment to a backend (manual routing)")
     p.add_argument("experiment")
     p.add_argument("--backend", required=True, choices=["local", "hpc"])
-    p.add_argument("--tasks")
+    p.add_argument("--tasks", help="indices, e.g. 100-199")
+    p.add_argument("--count", type=int, help="move the last N pending tasks (the tail of the pool)")
+
+    p = add("cancel", cmd_cancel, "cancel a task (EXP/KEY) or all unfinished tasks of an experiment (EXP)")
+    p.add_argument("target")
+    p = add("retry", cmd_retry, "requeue failed (and cancelled) tasks with a fresh retry budget")
+    p.add_argument("target")
+    p.add_argument("--failed-only", action="store_true")
+    p = add("logs", cmd_logs, "stdout/stderr of a task's accepted or latest attempt")
+    p.add_argument("task", help="EXPERIMENT/KEY or EXPERIMENT/INDEX")
+    p.add_argument("--attempt", help="attempt id (or its suffix)")
+    p.add_argument("--tail", type=int, default=50, help="lines per stream; 0 for all")
 
     add("tick", cmd_tick, "one reconcile + admission pass")
     p = add("run", cmd_run, "tick in the foreground until local work is done (no daemon needed)")
@@ -152,9 +163,43 @@ def cmd_submit(args) -> int:
     return 0
 
 
+def cmd_cancel(args) -> int:
+    ctl = make_controller()
+    counts = ctl.cancel(args.target)
+    kicked = _kick(ctl)
+    print(json.dumps(counts | {"controller": kicked}) if args.json else
+          f"cancelled {counts['pending_cancelled']} pending, signalled {counts['signalled']} running "
+          f"({counts['already_final']} already finished); {kicked}")
+    return 0
+
+
+def cmd_retry(args) -> int:
+    ctl = make_controller()
+    n = ctl.retry(args.target, failed_only=args.failed_only)
+    kicked = _kick(ctl)
+    print(json.dumps({"requeued": n, "controller": kicked}) if args.json else f"requeued {n} tasks; {kicked}")
+    return 0
+
+
+def cmd_logs(args) -> int:
+    ctl = make_controller()
+    try:
+        data = ctl.logs(args.task, attempt_id=args.attempt, tail=args.tail)
+    except BackendUnreachable as exc:
+        raise SwitchboardError(f"cannot read logs: {exc}") from exc
+    if args.json:
+        print(json.dumps(data))
+        return 0
+    print(f"attempt {data['attempt_id']} on {data['backend']} [{data['state']}]")
+    for stream, info in data["streams"].items():
+        print(f"--- {stream}: {info['path']}")
+        print("(missing)" if info["lines"] is None else ("\n".join(info["lines"]) or "(empty)"))
+    return 0
+
+
 def cmd_assign(args) -> int:
     ctl = make_controller()
-    n = ctl.assign(args.experiment, args.backend, args.tasks)
+    n = ctl.assign(args.experiment, args.backend, args.tasks, count=args.count)
     kicked = _kick(ctl)
     print(json.dumps({"assigned": n, "controller": kicked}) if args.json
           else f"{n} pending tasks assigned to {args.backend}; {kicked}")
@@ -205,7 +250,7 @@ def cmd_status(args) -> int:
         for backend, n in sorted(e["running"].items()):
             print(f"  Running {'locally' if backend == 'local' else 'on ' + backend.upper()}: {n}")
         for backend, n in sorted(e["submitted"].items()):
-            print(f"  Submitted/queued on {backend}: {n}")
+            print(f"  Queued on {'Mac' if backend == 'local' else backend.upper()}: {n}")
         pend = e["pending"]
         print(f"  Pending: {sum(pend.values())}" + (
             " (" + ", ".join(f"{k} {v}" for k, v in sorted(pend.items())) + ")" if pend else ""))
@@ -218,6 +263,8 @@ def cmd_status(args) -> int:
     print(f"Local budget ({loc['mode']}{', PAUSED' if loc['paused'] else ''}):")
     print(f"  CPU: {loc['cpus_reserved']} / {loc['cpus_budget']} threads reserved")
     print(f"  RAM: {loc['mem_gb_reserved']:.1f} / {loc['mem_gb_budget']:g} GB reserved")
+    print()
+    print("Policy: manual (switchboard submit/assign --backend); automatic routing arrives in M6")
     return 0
 
 

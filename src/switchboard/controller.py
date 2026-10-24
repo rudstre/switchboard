@@ -198,7 +198,7 @@ class Controller:
                       f" ({code_source or 'none'}); env[{executor.platform}] {short(env_id)}", self.actor)
         return result
 
-    def assign(self, experiment: str, backend: str, tasks: str | None = None) -> int:
+    def assign(self, experiment: str, backend: str, tasks: str | None = None, count: int | None = None) -> int:
         """Manually (re)assign pending, not-yet-dispatched tasks to a backend, pinning identities first."""
         exp = self._experiment(experiment)
         spec = self._spec(exp)
@@ -210,9 +210,64 @@ class Controller:
             raise IdentityMismatch(f"cannot assign to {backend}:\n  - " + "\n  - ".join(problems))
         n_tasks = self.conn.execute("SELECT count(*) FROM tasks WHERE experiment_id=?", (exp["id"],)).fetchone()[0]
         selected = parse_selection(tasks, n_tasks)
+        if count is not None:
+            # The *tail* of the pending pool: work the current backend would reach last.
+            tail = self.conn.execute(
+                "SELECT idx FROM tasks WHERE experiment_id=? AND state=? AND (assigned_backend IS NULL OR "
+                "assigned_backend!=?) ORDER BY idx DESC", (exp["id"], PENDING, backend)).fetchall()
+            selected = {r["idx"] for r in tail if r["idx"] in selected}
+            selected = set(sorted(selected, reverse=True)[:count])
         with db.tx(self.conn):
             self._pin_env(exp["id"], executor.platform, env_id)
             return self._assign_pending(exp["id"], backend, selected)
+
+    def cancel(self, ref: str) -> dict[str, int]:
+        """Cancel a task (EXP/KEY) or every unfinished task of an experiment (EXP)."""
+        tasks = self._resolve_tasks(ref)
+        counts = {"pending_cancelled": 0, "signalled": 0, "already_final": 0}
+        signal: dict[str, list[Tracked]] = {}
+        with db.tx(self.conn):
+            for t in tasks:
+                if t["state"] in (SUCCEEDED, FAILED, CANCELLED):
+                    counts["already_final"] += 1
+                    continue
+                self.conn.execute("UPDATE tasks SET cancel_requested=1 WHERE id=?", (t["id"],))
+                log_event(self.conn, "task", t["id"], t["state"], None, "cancel requested", self.actor)
+                if t["state"] == PENDING:
+                    transition(self.conn, "task", t["id"], CANCELLED, "cancelled by user before dispatch",
+                               self.actor, note="cancelled by user")
+                    counts["pending_cancelled"] += 1
+                    continue
+                for a in self.conn.execute(
+                        f"SELECT a.*, l.external_id FROM attempts a JOIN launches l ON l.id=a.launch_id "
+                        f"WHERE a.task_id=? AND a.state IN {ACTIVE_SQL}", (t["id"],)):
+                    if a["external_id"]:
+                        signal.setdefault(a["backend"], []).append(Tracked(a["id"], a["external_id"], a["array_idx"]))
+                counts["signalled"] += 1
+        for backend, tracked in signal.items():
+            try:
+                self.executors[backend].cancel(tracked)
+            except (BackendUnreachable, KeyError, RuntimeError, OSError):
+                pass  # re-sent by every reconcile pass until the attempts are final
+        return counts
+
+    def retry(self, ref: str, failed_only: bool = False) -> int:
+        """Requeue FAILED (and, unless failed_only, CANCELLED) tasks with a fresh retry budget."""
+        states = (FAILED,) if failed_only else (FAILED, CANCELLED)
+        n = 0
+        with db.tx(self.conn):
+            for t in self._resolve_tasks(ref):
+                if t["state"] in states:
+                    transition(self.conn, "task", t["id"], PENDING, "manual retry", self.actor,
+                               note="manual retry", retries_used=0, cancel_requested=0)
+                    n += 1
+        return n
+
+    def _resolve_tasks(self, ref: str) -> list[sqlite3.Row]:
+        if "/" in ref:
+            return [self.find_task(ref)]
+        exp = self._experiment(ref)
+        return self.conn.execute("SELECT * FROM tasks WHERE experiment_id=? ORDER BY idx", (exp["id"],)).fetchall()
 
     def _resubmit(self, existing, loaded, backend, executor, selected, env_id, warnings, dry_run) -> SubmitResult:
         spec = loaded.spec
@@ -394,6 +449,13 @@ class Controller:
             statuses = executor.read_status({r["id"]: r["attempt_dir"] for r in rows})
         except BackendUnreachable:
             statuses = None
+        cancelling = [Tracked(r["id"], r["external_id"], r["array_idx"]) for r in live
+                      if r["external_id"] and self._task(r["task_id"])["cancel_requested"]]
+        if cancelling and observed is not None:
+            try:
+                executor.cancel(cancelling)
+            except (BackendUnreachable, RuntimeError, OSError):
+                pass  # retried on the next pass
         if observed is None and statuses is None:
             with db.tx(self.conn):
                 for r in live:
@@ -539,6 +601,10 @@ class Controller:
             report.failed += 1
         if not was_current or task["accepted_attempt_id"] is not None:
             return  # a stale or superseded attempt never changes the task
+        if task["cancel_requested"]:
+            transition(self.conn, "task", task["id"], CANCELLED, f"cancelled by user ({reason_text})", self.actor,
+                       note="cancelled by user")
+            return
         if interrupted:
             n = self.conn.execute("SELECT count(*) FROM attempts WHERE task_id=? AND reason IN "
                                   "('interrupted','preempted')", (task["id"],)).fetchone()[0]
@@ -560,7 +626,12 @@ class Controller:
 
     def _task_back_to_pending(self, task_id: int, why: str) -> None:
         task = self._task(task_id)
-        if task["accepted_attempt_id"] is None and task["state"] != PENDING:
+        if task["accepted_attempt_id"] is not None:
+            return
+        if task["cancel_requested"]:
+            transition(self.conn, "task", task_id, CANCELLED, f"{why}; cancelled as requested", self.actor,
+                       note="cancelled by user")
+        elif task["state"] != PENDING:
             transition(self.conn, "task", task_id, PENDING, why, self.actor, note=why)
 
     # ---- local admission and dispatch --------------------------------------------------------
@@ -727,6 +798,36 @@ class Controller:
         if row is None:
             raise SwitchboardError(f"no task {task_ref} in {exp_ref}")
         return row
+
+    def logs(self, ref: str, attempt_id: str | None = None, tail: int = 50) -> dict:
+        """stdout/stderr of an attempt (default: the accepted or latest one), read wherever it ran."""
+        task = self.find_task(ref)
+        rows = self.conn.execute(
+            "SELECT a.*, l.external_id FROM attempts a JOIN launches l ON l.id=a.launch_id WHERE a.task_id=? "
+            "ORDER BY a.created_at", (task["id"],)).fetchall()
+        if not rows:
+            raise SwitchboardError(f"{ref} has not been dispatched yet ({task['note']})")
+        if attempt_id:
+            matches = [r for r in rows if r["id"] == attempt_id or r["id"].endswith(attempt_id)]
+            if not matches:
+                raise SwitchboardError(f"no attempt {attempt_id} for {ref}")
+            row = matches[0]
+        else:
+            row = next((r for r in rows if r["id"] == task["accepted_attempt_id"]), rows[-1])
+        executor = self.executors.get(row["backend"])
+        if executor is None:
+            raise SwitchboardError(f"backend {row['backend']} is not available in this build")
+        paths = {"stdout": f"{row['attempt_dir']}/stdout.log", "stderr": f"{row['attempt_dir']}/stderr.log"}
+        element_log = getattr(executor, "element_log", None)  # e.g. Slurm's own log for the array element
+        if element_log and row["external_id"]:
+            paths["slurm"] = element_log(row["launch_id"], row["external_id"], row["array_idx"] or 0)
+        texts = executor.read_text(list(paths.values()))
+        out = {"attempt_id": row["id"], "backend": row["backend"], "state": row["state"], "streams": {}}
+        for stream, path in paths.items():
+            text = texts.get(path)
+            lines = text.splitlines() if text is not None else None
+            out["streams"][stream] = {"path": path, "lines": lines[-tail:] if lines is not None and tail else lines}
+        return out
 
     def task_attempts(self, task_id: int) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM attempts WHERE task_id=? ORDER BY created_at", (task_id,)).fetchall()
