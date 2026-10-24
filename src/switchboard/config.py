@@ -54,11 +54,24 @@ class DaemonConfig:
 
 
 @dataclass(frozen=True)
+class HpcConfig:
+    host: str | None = None  # an ~/.ssh/config alias; None disables the hpc backend
+    remote_root: str = "~/.switchboard"  # runner and launch files on the cluster
+    python: str = "python3"  # used for the stdlib runner on login and compute nodes
+    remote_shell: str = "bash -lc"  # login shell so sbatch/squeue are on PATH
+    platform: str = "linux-64"
+    max_chunk: int = 500  # largest array per sbatch (also capped by MaxArraySize and submit limits)
+    control_persist: str = "12h"
+    remote_interval_s: float = 120.0  # daemon: reconcile the cluster at most this often
+
+
+@dataclass(frozen=True)
 class Config:
     home: Path
     budgets: dict[str, Budget] = field(default_factory=lambda: dict(DEFAULT_BUDGETS))
     local: LocalConfig = field(default_factory=LocalConfig)
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
+    hpc: HpcConfig = field(default_factory=HpcConfig)
     # Seconds a SUBMITTING launch must be positively absent before it is ABANDONED.
     submit_grace_s: float = 120.0
     # Seconds an attempt may be missing from its backend (with no final status) before it is LOST.
@@ -131,6 +144,8 @@ def load_config(path: Path | None = None, home: Path | None = None) -> Config:
             local_interval_s=float(daemon.get("local_interval_s", 5.0)),
             idle_interval_s=float(daemon.get("idle_interval_s", 300.0)),
         ),
+        hpc=HpcConfig(**{k: type(getattr(HpcConfig, k))(v) if getattr(HpcConfig, k) is not None else v
+                         for k, v in raw.get("hpc", {}).items() if k in HpcConfig.__dataclass_fields__}),
         submit_grace_s=float(controller.get("submit_grace_s", 120.0)),
         lost_grace_s=float(controller.get("lost_grace_s", 300.0)),
     )

@@ -134,3 +134,14 @@ def test_peak_rss_is_reported_in_megabytes(python, tmp_path):
     spec = make_spec(tmp_path, [sys.executable, SYNTH, "task", "--mem-mb", "200", "--write", "result.json"])
     run_shim(python, tmp_path, spec)
     assert 190 < status(spec)["peak_rss_mb"] < 400
+
+
+def test_unexpanded_paths_are_expanded_in_the_command_too(python, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    spec = make_spec(tmp_path, [sys.executable, SYNTH, "task", "--outdir", "~/att/out", "--write", "result.json"],
+                     attempt_dir="~/att", outdir="~/att/out")
+    path = tmp_path / "attempt.json"
+    path.write_text(json.dumps(spec))
+    subprocess.run([python, str(SHIM_PATH), str(path)], env={**os.environ, "HOME": str(home)}, timeout=60)
+    assert (home / "att" / "out" / "result.json").exists()

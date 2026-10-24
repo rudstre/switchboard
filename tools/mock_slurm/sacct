@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""mock sacct: -n -P [-X] [--name=N] [-S DATE] [--units=K] [-j IDS] -o FIELDS"""
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _mockslurm as m  # noqa: E402
+
+args = sys.argv[1:]
+
+
+def opt(flag):
+    for i, a in enumerate(args):
+        if a == flag and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+f = m.faults()
+if f.get("sacct_fail"):
+    print("sacct: error: Problem talking to the database: Connection refused", file=sys.stderr)
+    sys.exit(1)
+fields = (opt("-o") or opt("--format") or "JobID,State").split(",")
+alloc_only = "-X" in args
+name = opt("--name")
+ids = set((opt("-j") or "").split(",")) - {""}
+accounting = f.get("accounting", "linux") != "none"
+lag = float(f.get("sacct_lag_s", 0))
+now = time.time()
+
+
+def emit(row):
+    print("|".join(str(row.get(k, "")) for k in fields))
+
+
+for aj, job in sorted(m.read_state()["jobs"].items()):
+    if not m.visible(job) or (name and job["name"] != name) or (ids and aj not in ids):
+        continue
+    pending = []
+    for idx, el in sorted(job["elements"].items(), key=lambda kv: int(kv[0])):
+        if el["state"] == "PENDING":
+            pending.append(int(idx))
+            continue
+        if el["state"] in m.TERMINAL and now < el.get("end", 0) + lag:
+            continue  # accounting lag
+        elapsed = (el.get("end") or now) - el.get("start", now)
+        state = el["state"] + (" by 501" if el["state"] == "CANCELLED" else "")
+        jid = "%s_%s" % (aj, idx)
+        emit({"JobID": jid, "JobIDRaw": el["raw"], "State": state, "ExitCode": el.get("exit", "0:0"),
+              "Elapsed": m.fmt_elapsed(elapsed), "TotalCPU": m.fmt_cpu(el.get("cpu", 0)), "MaxRSS": "",
+              "JobName": job["name"]})
+        if alloc_only or el["state"] == "NODE_FAIL":
+            continue
+        emit({"JobID": jid + ".batch", "JobIDRaw": "%s.batch" % el["raw"], "State": el["state"],
+              "ExitCode": el.get("exit", "0:0"), "Elapsed": m.fmt_elapsed(elapsed),
+              "TotalCPU": m.fmt_cpu(el.get("cpu", 0)) if accounting else "",
+              "MaxRSS": "%dK" % el.get("maxrss_kb", 0) if accounting else "", "JobName": "batch"})
+        emit({"JobID": jid + ".extern", "JobIDRaw": "%s.extern" % el["raw"], "State": "COMPLETED",
+              "ExitCode": "0:0", "Elapsed": m.fmt_elapsed(elapsed), "TotalCPU": "00:00.001" if accounting else "",
+              "MaxRSS": "1024K" if accounting else "", "JobName": "extern"})
+    if pending:  # real sacct collapses not-yet-started array elements into one line
+        ranges, start = [], pending[0]
+        for a, b in zip(pending, pending[1:] + [None]):
+            if b != a + 1:
+                ranges.append(str(start) if start == a else "%d-%d" % (start, a))
+                start = b
+        emit({"JobID": "%s_[%s]" % (aj, ",".join(ranges)), "JobIDRaw": aj, "State": "PENDING", "ExitCode": "0:0",
+              "Elapsed": "00:00:00", "TotalCPU": "00:00:00", "MaxRSS": "", "JobName": job["name"]})

@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""mock sbatch: [--parsable] [--OPTION=VALUE ...] SCRIPT"""
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _mockslurm as m  # noqa: E402
+
+args = sys.argv[1:]
+parsable = "--parsable" in args
+script = [a for a in args if not a.startswith("-")][-1]
+opts = {}
+with open(script) as fh:
+    for line in fh:
+        mt = re.match(r"#SBATCH\s+--([\w-]+)(?:=(.*))?", line)
+        if mt:
+            opts[mt.group(1)] = (mt.group(2) or "").strip()
+for a in args:
+    if a.startswith("--") and "=" in a:
+        k, v = a[2:].split("=", 1)
+        opts[k] = v
+
+f = m.faults()
+if opts.get("partition") in f.get("bad_partitions", []):
+    print("sbatch: error: Batch job submission failed: Invalid partition name specified", file=sys.stderr)
+    sys.exit(1)
+array = opts.get("array", "0-0")
+rng, _, throttle = array.partition("%")
+lo, _, hi = rng.partition("-")
+n = int(hi or lo) - int(lo) + 1
+if n > int(f.get("max_array_size", 1001)):
+    print("sbatch: error: Batch job submission failed: Invalid job array specification", file=sys.stderr)
+    sys.exit(1)
+
+with m.locked() as st:
+    st["sbatch_calls"] += 1
+    aj = st["next_id"]
+    st["next_id"] += n + 1
+    st["jobs"][str(aj)] = {
+        "name": opts.get("job-name", "sbatch"), "user": os.environ.get("USER", "u"), "cwd": os.getcwd(),
+        "script": os.path.abspath(script), "n": n, "throttle": int(throttle) if throttle else n,
+        "output": opts.get("output", "slurm-%A_%a.out"), "cpus": opts.get("cpus-per-task", "1"),
+        "submitted": time.time(),
+        "elements": {str(i): {"state": "PENDING", "raw": aj + i} for i in range(n)},
+    }
+subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "_runner.py"), str(aj)],
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=open(m.p("runner.log"), "a"),
+                 start_new_session=True, cwd=m.DIR)
+drops = int(f.get("drop_after_accept", 0))
+if drops:
+    f["drop_after_accept"] = drops - 1
+    m.save_faults(f)
+    print("Connection to cluster closed by remote host.", file=sys.stderr)
+    sys.exit(255)
+print(aj if parsable else "Submitted batch job %d" % aj)

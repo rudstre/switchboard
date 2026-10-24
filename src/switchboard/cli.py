@@ -12,6 +12,7 @@ import logging
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from . import launchd, macos
 from .config import Config, load_config
@@ -19,6 +20,9 @@ from .controller import ACTIVE_SQL, Controller, SwitchboardError, display_name
 from .daemon import Daemon, DaemonAlreadyRunning, daemon_running, nudge
 from .executors.base import BackendUnreachable
 from .executors.pueue import PueueError, PueueExecutor
+from .executors.slurm import SlurmExecutor
+from .executors.transport import SSHTransport, TransportDown
+from .export import export_slurm
 from .ids import short
 from .spec import SpecError, load_spec
 
@@ -67,6 +71,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("daemon", cmd_daemon, "run or manage the background controller")
     p.add_argument("action", choices=["run", "install", "uninstall", "status", "plist"])
 
+    p = add("hpc", cmd_hpc, "cluster connection: connect (interactive, for MFA), check, probe, install runner")
+    p.add_argument("action", choices=["connect", "check", "probe", "install"])
+
+    p = add("export-slurm", cmd_export, "write a self-contained launch directory to sbatch by hand")
+    p.add_argument("spec")
+    p.add_argument("--out", required=True, help="new directory to create")
+    p.add_argument("--tasks")
+    p.add_argument("--code-id", help="pin a code identity for the shim to check")
+
     p = add("status", cmd_status, "experiment progress and local budget")
     p.add_argument("experiment", nargs="?")
     p = add("explain", cmd_explain, "why a task is where it is: routing, admission, attempts, events")
@@ -86,7 +99,17 @@ def build_parser() -> argparse.ArgumentParser:
 def make_controller(actor: str = "cli", cfg: Config | None = None) -> Controller:
     cfg = cfg or load_config()
     executors = {"local": PueueExecutor(cfg.launch_dir, cfg.local)}
+    if cfg.hpc.host:
+        executors["hpc"] = make_slurm(cfg)
     return Controller(cfg, executors, actor=actor, gates=local_gates(cfg))
+
+
+def make_slurm(cfg: Config) -> SlurmExecutor:
+    if not cfg.hpc.host:
+        raise SwitchboardError("no cluster configured: set [hpc] host = \"<ssh alias>\" in the config")
+    transport = SSHTransport(cfg.hpc.host, remote_shell=cfg.hpc.remote_shell, python=cfg.hpc.python,
+                             control_persist=cfg.hpc.control_persist)
+    return SlurmExecutor(transport, cfg.hpc)
 
 
 def local_gates(cfg: Config) -> list:
@@ -304,6 +327,38 @@ def cmd_daemon(args) -> int:
     return 0
 
 
+def cmd_hpc(args) -> int:
+    cfg = load_config()
+    ex = make_slurm(cfg)
+    if args.action == "connect":
+        code = ex.transport.connect_interactive()
+        print("connected; later commands reuse this SSH session" if code == 0 else "ssh failed", file=sys.stderr)
+        return code
+    try:
+        ex.transport.check()
+        if args.action == "check":
+            print(json.dumps({"reachable": True}) if args.json else f"{cfg.hpc.host}: reachable")
+        elif args.action == "probe":
+            info = ex.probe(refresh=True)
+            info["max_chunk_now"] = ex.max_chunk()
+            print(json.dumps(info) if args.json else "\n".join(f"{k}: {v}" for k, v in info.items()))
+        else:
+            path = ex.ensure_runner()
+            print(json.dumps({"runner": path}) if args.json else f"runner installed at {cfg.hpc.host}:{path}")
+    except (TransportDown, BackendUnreachable) as exc:
+        raise SwitchboardError(f"{cfg.hpc.host} unreachable: {exc}") from exc
+    return 0
+
+
+def cmd_export(args) -> int:
+    out = export_slurm(load_spec(args.spec), Path(args.out), python=load_config().hpc.python, tasks=args.tasks,
+                       code_id=args.code_id)
+    msg = (f"wrote {out}. Copy it to the cluster and run: cd <dir> && sbatch job.sbatch\n"
+           "This run is not tracked by switchboard.")
+    print(json.dumps({"dir": str(out)}) if args.json else msg)
+    return 0
+
+
 def cmd_doctor(args) -> int:
     cfg = load_config()
     checks: list[tuple[str, str, str]] = []  # (level, check, message)
@@ -329,6 +384,15 @@ def cmd_doctor(args) -> int:
     batt = macos.on_battery()
     checks.append(("warn" if batt and not cfg.local.run_on_battery else "ok", "power",
                    {True: "battery (local admissions gated)", False: "AC", None: "unknown"}[batt]))
+    if cfg.hpc.host:
+        try:
+            slurm = make_slurm(cfg)
+            slurm.transport.check()
+            checks.append(("ok", "hpc", f"{cfg.hpc.host} reachable"))
+        except (TransportDown, BackendUnreachable) as exc:
+            checks.append(("warn", "hpc", f"{exc}"))
+    else:
+        checks.append(("ok", "hpc", "not configured ([hpc] host); local only"))
     checks.append(("ok", "state", f"{cfg.db_path}; nudge socket {cfg.nudge_socket}"))
     if args.json:
         print(json.dumps([{"level": lv, "check": c, "message": m} for lv, c, m in checks]))

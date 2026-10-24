@@ -260,7 +260,7 @@ class Controller:
         b = spec.backends[backend]
         try:
             value = executor.fingerprint(spec.identity.code.model_dump(exclude_none=True),
-                                         backend_path(backend, b.workdir, spec_dir), b.setup)
+                                         executor.resolve_path(b.workdir, spec_dir), b.setup)
         except (FingerprintError, BackendUnreachable) as exc:
             raise SwitchboardError(f"cannot evaluate code identity on {backend}: {exc}") from exc
         return value, f"evaluated:{backend}"
@@ -271,7 +271,7 @@ class Controller:
         b = spec.backends[backend]
         try:
             return executor.fingerprint(spec.identity.env.model_dump(exclude_none=True),
-                                        backend_path(backend, b.workdir, spec_dir), b.setup)
+                                        executor.resolve_path(b.workdir, spec_dir), b.setup)
         except (FingerprintError, BackendUnreachable) as exc:
             raise SwitchboardError(f"cannot evaluate environment identity on {backend}: {exc}") from exc
 
@@ -297,17 +297,31 @@ class Controller:
 
     # ==== tick =================================================================================
 
-    def tick(self) -> TickReport:
+    def tick(self, remote: bool = True) -> TickReport:
+        """One pass. ``remote=False`` skips cluster backends (the daemon throttles those)."""
         report = TickReport()
         for name, executor in self.executors.items():
+            if name != "local" and not remote:
+                continue
             try:
                 self._reconcile_submitting(name, executor, report)
                 self._reconcile_active(name, executor, report)
+                if name != "local":
+                    self._dispatch_remote(executor, report)
             except BackendUnreachable:
                 report.unreachable.append(name)
         if "local" in self.executors and "local" not in report.unreachable:
             self._admit_local(self.executors["local"], report)
         return report
+
+    def remote_work_remaining(self) -> tuple[int, int]:
+        """(active remote attempts, pending remote tasks)."""
+        active = self.conn.execute(
+            f"SELECT count(*) FROM attempts WHERE backend!='local' AND state IN {ACTIVE_SQL}").fetchone()[0]
+        pending = self.conn.execute(
+            "SELECT count(*) FROM tasks WHERE state=? AND assigned_backend IS NOT NULL AND assigned_backend!='local'",
+            (PENDING,)).fetchone()[0]
+        return active, pending
 
     def local_work_remaining(self) -> tuple[int, int]:
         """(active local attempts, pending local tasks)."""
@@ -391,7 +405,17 @@ class Controller:
         now = self.clock()
         for r in rows:
             status = (statuses or {}).get(r["id"])
+            obs = (observed or {}).get(r["id"])
             if status and status.get("state") in (SUCCEEDED, FAILED, CANCELLED):
+                if status["state"] != SUCCEEDED and obs is not None and obs.state in ("RUNNING", "QUEUED") \
+                        and r["state"] != ABANDONED:
+                    # The shim has finished writing but the backend has not yet recorded why the attempt
+                    # ended (e.g. Slurm TIMEOUT/OOM). Wait a pass so its verdict can take precedence.
+                    continue
+                if status["state"] != SUCCEEDED and obs is not None and obs.reason:
+                    # e.g. Slurm TIMEOUT: the shim saw SIGTERM and wrote CANCELLED, but Slurm knows why.
+                    status = {**status, "state": FAILED if obs.reason != "cancelled_externally" else CANCELLED,
+                              "reason": obs.reason, "detail": f"{backend} reported {obs.detail}"}
                 self._finalize(r, status, report)
                 continue
             if r["state"] == ABANDONED:
@@ -402,7 +426,6 @@ class Controller:
                         transition(self.conn, "attempt", r["id"], UNKNOWN, f"{backend} unreachable", self.actor,
                                    unknown_since=now)
                 continue
-            obs = observed.get(r["id"])
             seen = obs.state if obs else "ABSENT"
             if status and status.get("state") == RUNNING and (
                     seen == "ABSENT" or (seen == "DONE" and obs.exit_code == EXIT_DUPLICATE)):
@@ -426,9 +449,15 @@ class Controller:
                     if obs is not None and obs.detail == '"Killed"':
                         died = {"state": CANCELLED, "reason": "interrupted",
                                 "detail": f"killed by {backend} (daemon shutdown or manual kill)"}
+                    elif obs is not None and obs.reason:
+                        died = {"state": CANCELLED if obs.reason == "cancelled_externally" else FAILED,
+                                "reason": obs.reason, "exit_code": code, "detail": f"{backend} reported {obs.detail}"}
                     else:
                         died = {"state": FAILED, "reason": "runner_died", "exit_code": code,
                                 "detail": f"runner ended (exit {code}) without a final status.json"}
+                    if obs is not None:  # backend accounting fills in what the dead shim could not record
+                        died.update({k: v for k, v in (("wall_s", obs.wall_s), ("cpu_s", obs.cpu_s),
+                                                        ("peak_rss_mb", obs.peak_rss_mb)) if v is not None})
                     self._finalize_in_tx(r, died, report)
                 elif seen == "RUNNING":
                     extra = {"started_at": status["started_at"]} if status and status.get("started_at") else {}
@@ -496,8 +525,9 @@ class Controller:
             return
 
         final = CANCELLED if status["state"] == CANCELLED else FAILED
-        interrupted = final == CANCELLED and not task["cancel_requested"]
-        if interrupted and reason != "interrupted":
+        interrupted = reason == "preempted" or (
+            final == CANCELLED and not task["cancel_requested"] and reason != "cancelled_externally")
+        if interrupted and reason not in ("interrupted", "preempted"):
             reason = "interrupted"
             reason_text = (f"interrupted (signal {status.get('signal')}) without a cancel request: daemon "
                            "shutdown, reboot or manual kill")
@@ -510,8 +540,8 @@ class Controller:
         if not was_current or task["accepted_attempt_id"] is not None:
             return  # a stale or superseded attempt never changes the task
         if interrupted:
-            n = self.conn.execute("SELECT count(*) FROM attempts WHERE task_id=? AND reason='interrupted'",
-                                  (task["id"],)).fetchone()[0]
+            n = self.conn.execute("SELECT count(*) FROM attempts WHERE task_id=? AND reason IN "
+                                  "('interrupted','preempted')", (task["id"],)).fetchone()[0]
             if n <= MAX_INTERRUPTIONS:
                 transition(self.conn, "task", task["id"], PENDING, f"{reason_text}; requeued without using a retry "
                            f"({n}/{MAX_INTERRUPTIONS})", self.actor, note=f"requeued after interruption {n}")
@@ -565,57 +595,83 @@ class Controller:
             with db.tx(self.conn):
                 self.conn.executemany("UPDATE tasks SET note=? WHERE id=?", changed)
         for task_id in decision.admit:
-            if self._dispatch(executor, by_id[task_id], budget.launch_prefix, decision.notes[task_id], report):
+            if self._dispatch(executor, [by_id[task_id]], decision.notes[task_id], report,
+                              prefix=budget.launch_prefix):
                 report.admitted += 1
 
-    def _dispatch(self, executor: Executor, task: sqlite3.Row, prefix: tuple[str, ...], why: str,
-                  report: TickReport) -> bool:
-        exp = self._experiment_by_id(task["experiment_id"])
-        spec = self._spec(exp)
+    def _dispatch_remote(self, executor: Executor, report: TickReport) -> None:
+        """Submit pending tasks assigned to a cluster backend as Slurm arrays (one launch per chunk)."""
+        rows = self.conn.execute(
+            "SELECT t.* FROM tasks t JOIN experiments e ON e.id=t.experiment_id WHERE t.state=? AND "
+            "t.assigned_backend=? ORDER BY e.created_at, t.idx LIMIT 5000", (PENDING, executor.name)).fetchall()
+        if not rows:
+            return
+        groups: dict[tuple, list[sqlite3.Row]] = {}
+        for r in rows:
+            groups.setdefault((r["experiment_id"], r["cpus"], r["mem_mb"], r["runtime_s"]), []).append(r)
+        for (exp_id, cpus, mem_mb, runtime_s), tasks in groups.items():
+            spec = self._spec(self._experiment_by_id(exp_id))
+            slurm = spec.backends[executor.name].slurm
+            options = {"cpus": cpus, "mem_mb": mem_mb, "time": slurm_time(slurm.time if slurm else None, runtime_s),
+                       "partition": slurm.partition if slurm else None, "account": slurm.account if slurm else None,
+                       "array_throttle": slurm.array_throttle if slurm else None,
+                       "extra": list(slurm.extra) if slurm else []}
+            while tasks:
+                size = executor.max_chunk() if hasattr(executor, "max_chunk") else len(tasks)
+                if size <= 0:
+                    with db.tx(self.conn):
+                        self.conn.executemany("UPDATE tasks SET note=? WHERE id=?", [
+                            (f"waiting: {executor.name} submit limit reached", t["id"]) for t in tasks])
+                    return
+                chunk, tasks = tasks[:size], tasks[size:]
+                if not self._dispatch(executor, chunk, f"submitted to {executor.name} as part of a "
+                                      f"{len(chunk)}-task array", report, options=options):
+                    return  # rejected or ambiguous: try again next pass
+                report.admitted += len(chunk)
+
+    def _dispatch(self, executor: Executor, tasks: list[sqlite3.Row], why: str, report: TickReport,
+                  prefix: tuple[str, ...] = (), options: dict | None = None) -> bool:
+        """Record intent for one launch of len(tasks) attempts, submit it, record the outcome."""
         backend = executor.name
-        b = spec.backends[backend]
-        attempt_id, launch_id = new_id("a"), new_id("l")
-        name = display_name(exp["name"], exp["run_no"])
-        output_root = backend_path(backend, b.output_root, exp["spec_dir"])
-        attempt_dir = Path(output_root) / dir_name(exp["name"], exp["run_no"]) / task["key"] / attempt_id
-        outdir = attempt_dir / "out"
-        params = json.loads(task["params_json"])
-        command = render_command(spec.command, {
-            "seed": task["seed"], "outdir": str(outdir), "params_file": str(attempt_dir / "params.json"),
-            "task_key": task["key"], "attempt_id": attempt_id, "experiment": name, "idx": task["idx"],
-            "param": params, "cpus": task["cpus"],
-        })
-        env_id = self._envs(exp["id"]).get(executor.platform)
-        attempt_spec = {
-            "schema": 1, "attempt_id": attempt_id, "task_key": task["key"], "experiment": name, "idx": task["idx"],
-            "attempt_dir": str(attempt_dir), "outdir": str(outdir),
-            "workdir": backend_path(backend, b.workdir, exp["spec_dir"]), "setup": b.setup,
-            "command": command, "env": spec.env, "cpus": task["cpus"], "params": params, "seed": task["seed"],
-            "outputs_expect": spec.outputs.expect, "compat": spec.compat,
-            "identity": spec.identity.model_dump(exclude_none=True) if spec.identity else None,
-            "expected": {"code_id": exp["code_id"], "env_id": env_id},
-            "nudge_socket": str(self.cfg.nudge_socket) if backend == "local" else None,
-        }
+        launch_id = new_id("l")
+        payloads, rows = [], []
+        for i, task in enumerate(tasks):
+            exp = self._experiment_by_id(task["experiment_id"])
+            spec = self._spec(exp)
+            b = spec.backends[backend]
+            attempt_id = new_id("a")
+            name = display_name(exp["name"], exp["run_no"])
+            output_root = executor.resolve_path(b.output_root, exp["spec_dir"])
+            attempt_dir = f"{output_root}/{dir_name(exp['name'], exp['run_no'])}/{task['key']}/{attempt_id}"
+            payloads.append(AttemptPayload(attempt_id, attempt_spec(
+                spec, name, task["key"], task["idx"], json.loads(task["params_json"]), task["seed"], task["cpus"],
+                attempt_id, attempt_dir, executor.resolve_path(b.workdir, exp["spec_dir"]), b.setup,
+                exp["code_id"], self._envs(exp["id"]).get(executor.platform),
+                str(self.cfg.nudge_socket) if backend == "local" else None)))
+            rows.append((attempt_id, task, i, attempt_dir))
         now = self.clock()
         with db.tx(self.conn):
             self.conn.execute("INSERT INTO launches(id, backend, state, created_at, updated_at) VALUES (?,?,?,?,?)",
                               (launch_id, backend, SUBMITTING, now, now))
-            self.conn.execute(
-                "INSERT INTO attempts(id, task_id, launch_id, backend, platform, state, attempt_dir, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (attempt_id, task["id"], launch_id, backend, executor.platform, SUBMITTING, str(attempt_dir), now),
-            )
-            log_event(self.conn, "attempt", attempt_id, None, SUBMITTING, f"intent recorded for task {task['key']} "
-                      f"(launch {launch_id})", self.actor, ts=now)
-            transition(self.conn, "task", task["id"], SUBMITTED, why, self.actor, note=why)
+            for attempt_id, task, i, attempt_dir in rows:
+                self.conn.execute(
+                    "INSERT INTO attempts(id, task_id, launch_id, backend, platform, array_idx, state, attempt_dir, "
+                    "created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (attempt_id, task["id"], launch_id, backend, executor.platform, i, SUBMITTING, attempt_dir, now),
+                )
+                log_event(self.conn, "attempt", attempt_id, None, SUBMITTING, f"intent recorded for task "
+                          f"{task['key']} (launch {launch_id}, element {i})", self.actor, ts=now)
+                transition(self.conn, "task", task["id"], SUBMITTED, why, self.actor, note=why)
         self._crashpoint("after_intent")
         try:
-            ref = executor.submit(LaunchUnit(launch_id, (AttemptPayload(attempt_id, attempt_spec),), prefix))
+            ref = executor.submit(LaunchUnit(launch_id, tuple(payloads), prefix, options or {}))
         except SubmitRejected as exc:
             with db.tx(self.conn):
                 transition(self.conn, "launch", launch_id, ABANDONED, f"rejected: {exc}", self.actor)
-                transition(self.conn, "attempt", attempt_id, ABANDONED, f"rejected by {backend}: {exc}", self.actor)
-                self._task_back_to_pending(task["id"], f"submission rejected by {backend}: {exc}")
+                for attempt_id, task, _, _ in rows:
+                    transition(self.conn, "attempt", attempt_id, ABANDONED, f"rejected by {backend}: {exc}",
+                               self.actor)
+                    self._task_back_to_pending(task["id"], f"submission rejected by {backend}: {exc}")
             return False
         except Exception as exc:  # ambiguous: may or may not exist; reconcile resolves it by launch_id
             with db.tx(self.conn):
@@ -626,8 +682,10 @@ class Controller:
         self._crashpoint("after_submit")
         with db.tx(self.conn):
             transition(self.conn, "launch", launch_id, "ACCEPTED", "accepted", self.actor, external_id=ref.external_id)
-            transition(self.conn, "attempt", attempt_id, SUBMITTED, f"submitted to {backend} as {ref.external_id}",
-                       self.actor)
+            for attempt_id, _, i, _ in rows:
+                transition(self.conn, "attempt", attempt_id, SUBMITTED,
+                           f"submitted to {backend} as {ref.external_id}" + (f"_{i}" if len(rows) > 1 else ""),
+                           self.actor)
         return True
 
     # ==== control, queries ======================================================================
@@ -766,12 +824,32 @@ def runner_alive(status: dict) -> bool | None:
         return False
 
 
-def backend_path(backend: str, path: str, spec_dir: str | Path) -> str:
-    """Local paths may be relative to the spec file; remote paths are left for the remote shell."""
-    if backend != "local":
-        return path
-    p = Path(path).expanduser()
-    return str(p if p.is_absolute() else (Path(spec_dir) / p).resolve())
+def attempt_spec(spec: ExperimentSpec, experiment: str, task_key: str, idx: int, params: dict, seed: int | None,
+                 cpus: int, attempt_id: str, attempt_dir: str, workdir: str, setup: str | None,
+                 code_id: str | None, env_id: str | None, nudge_socket: str | None) -> dict:
+    """The shim's input for one attempt (see runner/shim.py)."""
+    outdir = f"{attempt_dir}/out"
+    command = render_command(spec.command, {
+        "seed": seed, "outdir": outdir, "params_file": f"{attempt_dir}/params.json", "task_key": task_key,
+        "attempt_id": attempt_id, "experiment": experiment, "idx": idx, "param": params, "cpus": cpus,
+    })
+    return {
+        "schema": 1, "attempt_id": attempt_id, "task_key": task_key, "experiment": experiment, "idx": idx,
+        "attempt_dir": attempt_dir, "outdir": outdir, "workdir": workdir, "setup": setup, "command": command,
+        "env": spec.env, "cpus": cpus, "params": params, "seed": seed, "outputs_expect": spec.outputs.expect,
+        "compat": spec.compat, "identity": spec.identity.model_dump(exclude_none=True) if spec.identity else None,
+        "expected": {"code_id": code_id, "env_id": env_id}, "nudge_socket": nudge_socket,
+    }
+
+
+def slurm_time(explicit: str | None, runtime_s: float | None) -> str | None:
+    """Slurm --time: the spec's value, else 1.5x the declared runtime plus 5 minutes, else the cluster default."""
+    if explicit:
+        return explicit
+    if not runtime_s:
+        return None
+    minutes = int(runtime_s * 1.5 / 60) + 5
+    return f"{minutes // 60:02d}:{minutes % 60:02d}:00"
 
 
 def display_name(name: str, run_no: int) -> str:

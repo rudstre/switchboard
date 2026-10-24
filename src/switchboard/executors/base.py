@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, Protocol, Sequence
 
 
@@ -32,6 +33,7 @@ class LaunchUnit:
     launch_id: str  # idempotency key: Pueue label / Slurm --job-name
     attempts: tuple[AttemptPayload, ...]
     launch_prefix: tuple[str, ...] = ()
+    options: dict = field(default_factory=dict)  # backend-specific, e.g. Slurm cpus/mem/time/partition
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,12 @@ class Observation:
     state: Literal["QUEUED", "RUNNING", "DONE", "ABSENT"]
     exit_code: int | None = None
     detail: str = ""
+    # When the backend itself ended the attempt (Slurm TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, PREEMPTED,
+    # external scancel), the reason it gives overrides whatever the shim recorded while being killed.
+    reason: str | None = None
+    wall_s: float | None = None
+    cpu_s: float | None = None
+    peak_rss_mb: float | None = None
 
 
 class Executor(Protocol):
@@ -75,10 +83,18 @@ class Executor(Protocol):
 
     def cancel(self, tracked: Sequence[Tracked]) -> None: ...
 
+    def resolve_path(self, path: str, spec_dir: str | Path) -> str:
+        """Turn a spec path into the absolute path tasks will see on this backend."""
+
 
 @dataclass
 class LocalStatusReader:
-    """read_status for backends whose attempt directories are on this machine."""
+    """read_status and path resolution for backends whose attempt directories are on this machine."""
+
+    def resolve_path(self, path: str, spec_dir: str | Path) -> str:
+        """Local paths may be relative to the spec file."""
+        p = Path(os.path.expandvars(path)).expanduser()
+        return str(p if p.is_absolute() else (Path(spec_dir) / p).resolve())
 
     def read_status(self, attempt_dirs: dict[str, str]) -> dict[str, dict | None]:
         out: dict[str, dict | None] = {}

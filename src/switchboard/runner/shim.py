@@ -55,6 +55,13 @@ def main(argv: list) -> int:
 
 
 def run(spec: dict) -> int:
+    raw_dir = spec["attempt_dir"]
+    for key in ("attempt_dir", "outdir", "workdir"):  # specs written off-cluster may say ~ or $USER
+        spec[key] = os.path.expandvars(os.path.expanduser(spec[key]))
+    if raw_dir != spec["attempt_dir"]:  # {outdir}/{params_file} in the command derive from attempt_dir
+        cmd = spec["command"]
+        fix = lambda text: text.replace(raw_dir, spec["attempt_dir"])  # noqa: E731
+        spec["command"] = fix(cmd) if isinstance(cmd, str) else [fix(part) for part in cmd]
     attempt_dir = spec["attempt_dir"]
     os.makedirs(attempt_dir, exist_ok=True)
     try:

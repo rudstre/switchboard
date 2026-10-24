@@ -79,13 +79,20 @@ class Daemon:
         ctl: Controller | None = None
         failures = 0
         d = self.cfg.daemon
+        last_remote = 0.0
+        self._force_remote = True
         while not self._stop:
-            busy = False
+            busy = remote_busy = False
             try:
                 ctl = ctl or self.make_controller()
-                report = ctl.tick()
+                remote = self._force_remote or time.monotonic() - last_remote >= self.cfg.hpc.remote_interval_s
+                report = ctl.tick(remote=remote)
+                if remote:
+                    last_remote, self._force_remote = time.monotonic(), False
                 active, pending = ctl.local_work_remaining()
                 busy = bool(active or pending)
+                r_active, r_pending = ctl.remote_work_remaining()
+                remote_busy = bool(r_active or r_pending)
                 failures = 0
                 summary = {k: v for k, v in report.as_dict().items() if v}
                 if summary:
@@ -99,8 +106,12 @@ class Daemon:
                 return
             if failures:
                 timeout = min(d.idle_interval_s, d.local_interval_s * 2 ** min(failures, 10))
+            elif busy:
+                timeout = d.local_interval_s
+            elif remote_busy:
+                timeout = min(d.idle_interval_s, self.cfg.hpc.remote_interval_s)
             else:
-                timeout = d.local_interval_s if busy else d.idle_interval_s
+                timeout = d.idle_interval_s
             ready, _, _ = select.select([sock, wake_r], [], [], timeout)
             if sock in ready:
                 self._drain(sock)
@@ -111,7 +122,8 @@ class Daemon:
         sock.setblocking(False)
         try:
             while True:
-                sock.recv(64)
+                if sock.recv(64) == b"cli":  # a user action: reconcile the cluster now too
+                    self._force_remote = True
                 self.nudges += 1
         except BlockingIOError:
             pass

@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""mock scontrol show config"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _mockslurm as m  # noqa: E402
+
+f = m.faults()
+print("Configuration data as of mock")
+print("AccountingStorageType   = accounting_storage/slurmdbd")
+print("JobAcctGatherType       = jobacct_gather/%s" % ("none" if f.get("accounting") == "none" else "linux"))
+print("MaxArraySize            = %d" % int(f.get("max_array_size", 1001)))
+print("MaxJobCount             = 10000")
+print("SLURM_VERSION           = 23.11.0-mock")

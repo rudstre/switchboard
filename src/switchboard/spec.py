@@ -23,7 +23,7 @@ from . import SHIM_MAJOR
 from .ids import canonical_json, sha256_hex
 
 BackendName = Literal["local", "hpc"]
-RetryReason = Literal["nonzero", "missing_outputs", "lost", "runner_died", "node_fail", "timeout"]
+RetryReason = Literal["nonzero", "missing_outputs", "lost", "runner_died", "node_fail", "timeout", "oom"]
 
 TEMPLATE_FIELDS = {"seed", "outdir", "params_file", "task_key", "attempt_id", "experiment", "idx", "param", "cpus"}
 
@@ -92,7 +92,7 @@ class Identity(_Model):
 
 class Retries(_Model):
     max: int = Field(0, ge=0)
-    on: list[RetryReason] = ["nonzero", "lost", "runner_died"]
+    on: list[RetryReason] = ["nonzero", "lost", "runner_died", "node_fail"]
 
 
 class SlurmOptions(_Model):

@@ -9,15 +9,15 @@ A repository-agnostic controller for research jobs.
   - **at most one accepted result per task**;
   - no silent reuse of results when code or environments change.
 
-**Status:** M0–M2.
+**Status:** M0–M3.
 - M0 + M1: core model, runner shim, responsiveness benchmark.
-- M2: Pueue execution, memory-pressure and battery gates, adaptive daemon with completion nudges.
+- M2: Pueue execution, gates, adaptive daemon.
+- M3: Slurm arrays over SSH. Tested against a mock cluster; not yet run on the real one (see [docs/m3-cluster-checklist.md](docs/m3-cluster-checklist.md)).
 
 Coming next:
 
 | Milestone | Adds |
 |---|---|
-| M3 | Slurm |
 | M4 | Mixed routing and the rest of the CLI |
 | M5 | Activity detection |
 | M6 | Local-first routing with HPC overflow |
@@ -73,6 +73,39 @@ local_interval_s = 5
 idle_interval_s = 300
 ```
 
+## Cluster (Slurm over SSH)
+
+```toml
+[hpc]
+host = "mycluster"            # ~/.ssh/config alias; no credentials are stored
+remote_root = "~/.switchboard"
+```
+
+**Connecting:**
+- `switchboard hpc connect` opens a persistent SSH session (authenticate once, MFA included).
+- `hpc check` and `hpc probe` are read-only: probe reports MaxArraySize, submit limits and the accounting type.
+- `hpc install` copies the stdlib runner into a directory named by its content hash.
+
+**How tasks run:**
+- Tasks assigned to `hpc` are submitted as `sbatch --array` chunks, sized within MaxArraySize and your submit headroom.
+- Each chunk's job is named `sb-<launch>`. That name is how a submission whose reply was lost is found again, instead of being resubmitted.
+- Jobs use `--no-requeue`; retries are new attempts.
+
+**Outcomes:**
+
+| Slurm outcome | Recorded as |
+|---|---|
+| TIMEOUT | `timeout` |
+| OUT_OF_MEMORY | `oom` |
+| NODE_FAIL | `node_fail` (retryable by default) |
+| PREEMPTED | an interruption: requeued without using a retry |
+| A `scancel` you ran yourself | the task is CANCELLED, not requeued |
+
+**Accounting and escape hatches:**
+- CPU and memory figures come from `sacct` step lines; `sacct -X` would omit them.
+- Every generated `job.sbatch` is self-contained.
+- `switchboard export-slurm SPEC --out DIR` writes a launch directory you can `sbatch` by hand, with no switchboard involved.
+
 ## Spec
 
 See [examples/synthetic-grid.yaml](examples/synthetic-grid.yaml). The sections are:
@@ -111,7 +144,9 @@ See [examples/synthetic-grid.yaml](examples/synthetic-grid.yaml). The sections a
 | `spec.py` | validation, expansion, identity hash, templating |
 | `registry/` | SQLite schema, WAL transactions, state machine with event log |
 | `runner/shim.py`, `runner/fingerprint.py` | stdlib-only, Python ≥ 3.8; shipped verbatim to the HPC in M3 |
-| `executors/` | executor protocol; `pueue.py` (local, Pueue 4.x); `fake.py` is the in-process test double |
+| `executors/` | executor protocol; `pueue.py` (local, Pueue 4.x); `slurm.py` + `transport.py` (SSH); `fake.py` test double |
+| `export.py` | registry-free, self-contained Slurm launch directories |
+| `tools/mock_slurm/` | sbatch/squeue/sacct/scancel/scontrol/sacctmgr stand-ins with fault injection (tests) |
 | `macos.py` | memory-pressure and power readings, and the admission gates built on them |
 | `daemon.py`, `launchd.py` | adaptive background loop with nudge socket and lock; LaunchAgent install |
 | `controller.py` | submit/assign with identity pinning, reconcile, acceptance CAS, admission |
