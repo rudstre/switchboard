@@ -1,236 +1,555 @@
 # switchboard
 
-A repository-agnostic controller for research jobs.
+**switchboard runs your analysis jobs on your Mac when it's free, and on the cluster when it isn't.**
 
-- **Where it runs tasks:** on this Mac (via Pueue) or on an HPC cluster (via Slurm over SSH).
-- **What it tracks:** every task and attempt, in a SQLite registry.
-- **What it promises:**
-  - **at-least-once execution**;
-  - **at most one accepted result per task**;
-  - no silent reuse of results when code or environments change.
+You describe your experiment once, for example "run `fit_model.py` for these 200 parameter
+combinations". switchboard then works out where each run should happen, starts it, watches it, and
+tells you where the results are. You don't write `sbatch` scripts, keep spreadsheets of job IDs, or
+find yourself wondering "did run 137 actually finish?"
 
-**Status:** all planned milestones (M0–M6).
-- M0 + M1: core model, runner shim, responsiveness benchmark.
-- M2: Pueue execution, gates, adaptive daemon.
-- M3: Slurm arrays over SSH; smoke-tested on the SWC cluster.
-- M4: manual mixed routing, cancel, retry, logs.
-- M5: activity detection and `mode auto`.
-- M6: automatic local-first routing with cluster overflow.
+---
 
-Deferred: the `throughput-first` policy, runtime prediction from history, and data staging.
+## Why would I want this?
 
-## Quick start
+A familiar situation:
+
+- You have a parameter sweep: 200 combinations of `theta` and random seed.
+- Each run takes about 30 minutes on one CPU.
+- Normally you'd write a Slurm script, submit it to the cluster, and wait in the queue.
+- Meanwhile your MacBook, which has 15 fast cores, sits idle all evening.
+
+With switchboard you run one command:
 
 ```bash
-brew install pueue && brew services start pueue      # Pueue 4.x runs the local tasks
-uv sync
-uv run switchboard doctor
-uv run switchboard daemon install    # optional: background controller (launchd LaunchAgent)
-uv run switchboard submit examples/synthetic-grid.yaml --backend local
-uv run switchboard status
-uv run switchboard explain synthetic-grid/3
-uv run switchboard results synthetic-grid --json
+switchboard submit sweep.yaml --backend auto
 ```
 
-**Automatic routing (`--backend auto`):**
+Then:
+
+1. It keeps as much of the sweep as your Mac can finish within a few hours, and runs it there.
+2. It sends the rest to the cluster as a single Slurm job array.
+3. While you're working on the Mac, it uses only a few cores, so your computer stays responsive.
+4. When you lock the screen or walk away, it uses more cores.
+5. When you come back, you run `switchboard status` and see what finished and where everything is.
+
+## How it works, in one picture
+
+```
+              you
+               │   switchboard submit sweep.yaml
+               ▼
+        ┌─────────────┐   keeps a record of every run (what, where, when, result)
+        │ switchboard │──────────────────────────────────────────────────────────
+        └─────────────┘
+          │         │
+  "Mac can do it"   "too much for the Mac right now"
+          │         │
+          ▼         ▼
+     your Mac     the cluster (Slurm, over SSH)
+   (in the gaps)   (as job arrays)
+          │         │
+          └────┬────┘
+               ▼
+      one result folder per run, listed by `switchboard results`
+```
+
+The important ideas:
+
+- **An experiment** is one YAML file. It says which command to run, which parameters to sweep, and
+  what output each run should produce.
+- **A task** is one combination of parameters, so a 200-combination sweep has 200 tasks.
+- **A task succeeds only when its output files exist.** "The program exited without an error" isn't
+  enough on its own.
+- **Each task produces exactly one accepted result.** If something goes wrong and a run happens twice
+  (a dropped connection, say), switchboard keeps only one result and tells you which.
+
+---
+
+## What you need
+
+- **A Mac** with Apple Silicon. This was built on an M5 Pro, but any recent Mac works.
+- **[uv](https://docs.astral.sh/uv/)**, a tool for running Python projects. Install it with
+  `brew install uv` if you don't already have it.
+- **[Pueue](https://github.com/Nukesor/pueue)**, which actually runs the jobs on your Mac. Install it
+  with `brew install pueue`.
+- **Optional: an account on a Slurm cluster** that you can reach with `ssh` from your Mac.
+
+You do **not** need administrator rights, and nothing needs installing on the cluster beyond Python 3.
+
+## Install
+
+```bash
+git clone https://github.com/rudstre/switchboard.git
+cd switchboard
+uv tool install --editable .   # puts the `switchboard` command on your PATH
+brew services start pueue      # start Pueue now and at every login
+switchboard doctor             # checks that everything is in place
+```
+
+If you'd rather not install the command, run `uv sync` once inside the folder, then prefix every
+command below with `uv run`, for example `uv run switchboard status`.
+
+`switchboard doctor` prints a checklist like this:
+
+```
+[  ok] pueue: pueue 4.0.4
+[  ok] pueued: reachable; group 'switchboard' parallel=64 status=Running
+[warn] daemon: not running; commands tick inline. Install with `switchboard daemon install`.
+[  ok] memory pressure: NORMAL
+[  ok] power: AC
+[  ok] hpc: not configured ([hpc] host); local only
+```
+
+---
+
+## A five-minute tour
+
+The repository includes a small, fake experiment, [examples/synthetic-grid.yaml](examples/synthetic-grid.yaml).
+It has 12 tasks that each burn a CPU for about a second and write a file. Try it:
+
+```bash
+switchboard submit examples/synthetic-grid.yaml --backend local
+switchboard run       # stays in the foreground until the local work is done
+switchboard status
+```
+
+You'll see something like:
+
+```
+Experiment: synthetic-grid
+  Tasks: 12   Completed: 12   Failed: 0   Cancelled: 0
+  Pending: 0
+  Policy: manual
+
+Local budget (auto -> focus):
+  activity: input 0s ago
+  CPU: 0 / 4 threads reserved
+  RAM: 0.0 / 12 GB reserved
+```
+
+To ask about a single task (task 3 here):
+
+```bash
+switchboard explain synthetic-grid/3
+```
+
+```
+Task synthetic-grid/00003-d7b6d7ed  [SUCCEEDED]
+  params: {"alpha":0.2}  seed: 2
+  backend: local   reservation: 1 cpus, 0.5 GB   retries used: 0
+  attempt a-01a169a3e0e6-e856803fec on local: SUCCEEDED  wall 1.1s, cpu 1.0s, peak 30 MB  <- accepted
+    dir: .../sb-out/synthetic-grid/00003-d7b6d7ed/a-01a169a3e0e6-e856803fec
+```
+
+To list where every result lives:
+
+```bash
+switchboard results synthetic-grid
+```
+
+That's the whole loop: **submit, check status, collect results.** Everything below is detail.
+
+---
+
+## Describing your own experiment
+
+Here is a realistic example. Suppose your project has a script you'd normally run like this:
+
+```bash
+python fit_model.py --theta 0.5 --seed 3 --out results/theta0.5_seed3
+```
+
+and you want it for 20 values of `theta` × 10 seeds. Save this as `sweep.yaml`:
+
+```yaml
+experiment: theta-sweep            # a short name you'll use in commands
+
+# The command to run. Words in {braces} are filled in for each task.
+command: ["python", "fit_model.py",
+          "--theta", "{param.theta}",
+          "--seed", "{seed}",
+          "--out", "{outdir}"]       # switchboard gives every run its own empty output folder
+
+params:
+  grid:
+    theta: {linspace: [0, 1, 20]}  # 20 evenly spaced values from 0 to 1
+  seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+# 20 thetas x 10 seeds = 200 tasks
+
+resources:
+  cpus: 1                          # how many cores one run uses
+  mem_gb: 2                        # roughly how much memory one run needs
+  runtime_min: 30                  # a rough guess at how long one run takes
+
+outputs:
+  expect: ["fit.npz", "summary.json"]   # a run only counts as done if these files appear
+
+retries:
+  max: 1                           # retry a failed run once before giving up
+
+backends:
+  local:                           # how to run it on your Mac
+    workdir: ~/code/my-project
+    output_root: ~/results/switchboard
+    setup: "source .venv/bin/activate"
+  hpc:                             # how to run it on the cluster
+    workdir: ~/my-project
+    output_root: /ceph/scratch/$USER/switchboard
+    setup: "source ~/my-project/.venv/bin/activate"
+    slurm: {partition: cpu, time: "01:00:00"}
+```
+
+`setup` is any shell snippet that prepares the environment, such as activating a virtualenv or conda
+env. If you rely on `module load` and it reports `module: command not found` on the cluster, start the
+snippet with `source /etc/profile && `. Batch jobs don't always get a login shell.
+
+**The placeholders you can use in `command`:**
+
+| Placeholder | Becomes |
+|---|---|
+| `{param.NAME}` | that task's value of a parameter, e.g. `{param.theta}` → `0.473` |
+| `{seed}` | that task's seed |
+| `{outdir}` | an empty folder created just for this run; write your outputs here |
+| `{params_file}` | a JSON file containing all of this task's parameters, if your script prefers that |
+
+**Ways to describe parameters:**
+
+```yaml
+params:
+  grid:                            # every combination of these
+    theta: [0.1, 0.2, 0.5]
+    n_neurons: {range: [100, 1000, 100]}   # 100, 200, ..., 900
+  zip:                             # these go together, pair by pair
+    dataset: [mouse1, mouse2]
+    session: [s03, s07]
+  seeds: [1, 2, 3]
+```
+
+For irregular combinations, list one task per line in a file and point to it with
+`params: {manifest: tasks.jsonl}`. Each line looks like
+`{"theta": 0.3, "n_neurons": 500, "seed": 1}`.
+
+> **Your script needs very little.** switchboard only asks that it accept an output folder (and
+> ideally a seed), and write its results there. If your script already reads `SLURM_ARRAY_TASK_ID`,
+> add `compat: slurm-array` and it will get that variable on your Mac too.
+
+---
+
+## Choosing where things run
+
+When you submit, pick one of three options:
+
+```bash
+switchboard submit sweep.yaml --backend auto    # let switchboard decide (recommended)
+switchboard submit sweep.yaml --backend local   # everything on your Mac
+switchboard submit sweep.yaml --backend hpc     # everything on the cluster
+```
+
+### What `--backend auto` does
+
+By default it's **local-first**: the Mac keeps whatever it can finish within 6 hours, and the rest
+goes to the cluster.
+
+A worked example with the sweep above (200 tasks × 30 min × 1 core):
+
+- While you're at your desk, the Mac offers **4 cores**.
+- In 6 hours, 4 cores can do 4 × 6 = 24 core-hours of work. That's **48 runs** of 30 minutes each.
+- So switchboard keeps the first 48 tasks on the Mac and sends the other **152 to the cluster** as
+  one job array.
+
+Ask about one of the overflowed tasks and it tells you why:
+
+```bash
+switchboard explain theta-sweep/150
+```
+
+```
+  routing: [R5] local-first overflow: the Mac would finish it in ~18.9 h at the 'focus' budget,
+           over the 6.0 h limit
+```
+
+You can change the limit, or the policy, in the YAML:
 
 ```yaml
 placement:
-  policy: local-first          # or local-only, hpc-only
-  max_local_wait_h: 6          # overflow work the Mac would not finish within this
-  platforms: [osx-arm64, linux-64]
-resources: {cpus: 1, mem_gb: 2, runtime_min: 30}   # the declared runtime drives the estimate
+  policy: local-first     # or local-only (never use the cluster), or hpc-only
+  max_local_wait_h: 6     # how long you're willing to wait for the Mac
 ```
+
+A few behaviours worth knowing:
+
+- **The split is re-checked continuously** for tasks that haven't started. If you go home and the
+  Mac gets more cores, more of the remaining work stays local.
+- **A task that has started never moves.**
+- **If the cluster is down, everything waits for the Mac.**
+- **If a task can't run on the Mac at all**, it goes to the cluster automatically. That covers code
+  that needs Linux, or a task that needs more cores or memory than the Mac offers.
+
+### Splitting by hand
+
+Sometimes you just want to say "send 120 of these to the cluster":
 
 ```bash
-switchboard submit grid.yaml --backend auto
-switchboard explain grid/150    # routing: [R5] local-first overflow: the Mac would finish it in ~9.4 h ...
-switchboard policy grid hpc-only
+switchboard submit sweep.yaml --backend local
+switchboard assign theta-sweep --backend hpc --count 120     # moves the last 120 waiting tasks
+switchboard assign theta-sweep --backend local --tasks 0-9   # or move specific tasks back
 ```
 
-Every pass, pending tasks are routed in queue order. The first rule that applies wins:
+---
 
-| Rule | When | Result |
+## Your Mac stays usable
+
+switchboard never uses the whole machine. It works with two budgets:
+
+| When | Cores | Memory |
 |---|---|---|
-| R1 | the policy is `local-only` or `hpc-only` | that backend |
-| R2 | the Mac can't run the task (platform, or more CPUs/memory than its largest budget) | cluster |
-| R3 | the cluster isn't usable (not configured, unreachable, no `backends.hpc`, or a code/env identity mismatch, checked once over SSH) | Mac |
-| R4 | there is no runtime estimate | Mac |
-| R5 | `local-first` | see below |
+| **focus**: you're using the Mac | 4 | 12 GB |
+| **away**: screen locked, or idle for 10+ minutes | 12 | 28 GB |
 
-Under R5, the Mac keeps whatever it would finish within `max_local_wait_h`. It counts the work it already owes, divided by the CPUs of the current budget profile. The tail of the queue overflows to the cluster as Slurm arrays.
+It decides which one applies by itself (this is `mode auto`). It counts as **focus** when:
+- you've typed or used the trackpad in the last 2 minutes;
+- you're on a video call or watching something, even without touching the keyboard;
+- something else, like a big build, is already keeping the CPU busy.
 
-Routing is late-bound: pending tasks are re-evaluated on every pass, and dispatched tasks never move. `switchboard assign` turns automatic routing off for that experiment, and `switchboard policy EXP local-first` turns it back on.
+It switches to **away** only once that's been true for a couple of minutes. Not typing alone doesn't
+count as away.
 
-**Splitting one experiment by hand:**
-
-```bash
-switchboard submit grid.yaml --backend local            # every task starts in the Mac's pool
-switchboard assign grid --backend hpc --count 120       # move the last 120 pending tasks to the cluster
-switchboard assign grid --backend local --tasks 150-159 # or move specific pending tasks back
-```
-
-**Watching and managing tasks:**
+You can always take over:
 
 ```bash
-switchboard status grid
-switchboard explain grid/42                             # routing, admission reason, attempt history
-switchboard logs grid/42                                # stdout/stderr (+ Slurm's log), local or over SSH
-switchboard cancel grid/42                              # or `cancel grid` for every unfinished task
-switchboard retry grid --failed-only                    # requeue with a fresh retry budget
+switchboard mode            # what does it think is happening, and why?
+switchboard mode focus      # force the small budget
+switchboard mode away       # force the big budget
+switchboard mode auto       # go back to automatic
+switchboard pause-local     # start nothing new on the Mac (running jobs carry on)
+switchboard resume-local
 ```
 
-Assigning a task to a backend pins the code and environment identity there first, and refuses on a mismatch. Tasks never move once dispatched.
+It also protects the Mac on its own:
+- **No new local jobs start on battery power**, or when the Mac is short of memory.
+- **Running jobs are never killed** to make room.
+- **While jobs run on mains power, it stops the Mac from going to sleep on its own.** Closing the lid
+  still puts it to sleep.
 
-- **Without the daemon:** each command runs one controller pass inline, and `switchboard run` ticks in the foreground until local work is done.
-- **With the daemon:** commands nudge it.
-- **Daemon cadence:**
-  - it wakes immediately on a nudge: from the CLI, or from the shim when a task exits;
-  - it polls every 5 s while local work exists;
-  - otherwise it polls every 300 s.
+The default budgets came from measuring this Mac's responsiveness under load; see
+[docs/benchmarks](docs/benchmarks/2026-10-23-m5pro-ac.md). You can change them in the config file
+(see [Configuration](#configuration)).
 
-**Local guarantees:**
-- Pueue only ever receives admitted tasks, in the `switchboard` group, and the controller does all queueing.
-- No new local tasks start under memory pressure ≥ WARN, on battery (unless `local.run_on_battery = true`), or after `switchboard pause-local`.
-- Running tasks are never killed by the controller.
-- `pause-local --suspend` SIGSTOPs running tasks, which frees CPU but not memory.
-- A task killed by a Pueue restart, a reboot or a manual kill is requeued without using a retry, up to 3 times.
+---
 
-**Activity (`mode auto`, the default):**
+## Keeping an eye on things
 
-`switchboard mode` shows the chosen profile, why it was chosen, and the live sensor readings. `switchboard mode focus|away` overrides; `switchboard mode auto` goes back to following activity.
+```bash
+switchboard status                     # every experiment
+switchboard status theta-sweep         # one experiment
+switchboard explain theta-sweep/42     # everything about task 42: where, why, and what happened
+switchboard logs theta-sweep/42        # its printed output, from the Mac or the cluster
+```
 
-The `focus` budget applies immediately when any of these holds:
-- you used the keyboard or trackpad in the last 2 minutes;
-- an app keeps the display awake (video, presentation) or is using the microphone (calls);
-- other work is using more than 3 cores, which is protected even if you are away.
+A typical `status` mid-run:
 
-The `away` budget applies only after away evidence has held for 2 minutes. Away evidence is either:
-- the screen is locked or the display is asleep; or
-- there has been no input for 10 minutes, nothing holds the display or microphone, and the CPU is quiet.
+```
+Experiment: theta-sweep
+  Tasks: 200   Completed: 84   Failed: 0   Cancelled: 0
+  Running locally: 4
+  Running on HPC: 16
+  Pending: 96 (hpc 80, local 16)
+  Policy: local-first (max local wait 6 h)
 
-Not typing, on its own, never counts as away. `corespeechd` ("Hey Siri") is ignored as a microphone user, and more processes can be ignored with `[activity] ignore_holders`.
+Local budget (auto -> away):
+  activity: screen locked (for 3 min)
+  CPU: 4 / 12 threads reserved
+  RAM: 8.0 / 28 GB reserved
+  Mac queue: ~2.0 h of declared work at this budget
+```
 
-While local tasks run on AC power, the daemon holds a `caffeinate -i` assertion so idle sleep doesn't freeze them. Closing the lid still sleeps the Mac. Turn this off with `[local] prevent_idle_sleep = false`.
+Tasks are referred to as `EXPERIMENT/NUMBER`, for example `theta-sweep/42`. The numbers count from 0
+in the order the tasks were generated.
 
-- **State location:** `~/.switchboard/` (override with `SWITCHBOARD_HOME`).
-- **Config:** `~/.config/switchboard/config.toml` (override with `SWITCHBOARD_CONFIG`), for example:
+## Getting your results
+
+```bash
+switchboard results theta-sweep          # a table: task, where it ran, output folder
+switchboard results theta-sweep --json   # the same, for scripts
+```
+
+Each run's output folder contains whatever your script wrote to `{outdir}`. To load everything in
+Python:
+
+```python
+import json, subprocess
+import numpy as np
+
+rows = json.loads(subprocess.check_output(["switchboard", "results", "theta-sweep", "--json"]))
+for r in rows:
+    data = np.load(f"{r['outdir']}/fit.npz")
+    print(r["params"]["theta"], r["seed"], r["backend"], data["loss"])
+```
+
+> **Use `switchboard results` rather than searching folders yourself.** If a run happened twice, it
+> lists only the accepted copy.
+
+---
+
+## When things go wrong
+
+| You see | It means | What to do |
+|---|---|---|
+| `FAILED (nonzero)` | your script exited with an error | `switchboard logs EXP/N` to read its output |
+| `FAILED (missing_outputs)` | your script finished, but the files in `outputs.expect` weren't there | check the script writes to `{outdir}` |
+| `FAILED (timeout)` | the cluster stopped it at its time limit | raise `slurm.time` |
+| `FAILED (oom)` | the cluster stopped it for using too much memory | raise `resources.mem_gb` |
+| `FAILED (fingerprint_mismatch)` | your code changed after you submitted | see the question about changing code below |
+| `UNKNOWN` | the cluster can't be reached right now | nothing; it catches up when the connection is back |
+
+```bash
+switchboard retry theta-sweep --failed-only   # run the failed tasks again
+switchboard cancel theta-sweep/42             # stop one task
+switchboard cancel theta-sweep                # stop everything that hasn't finished
+```
+
+---
+
+## Setting up the cluster (one time)
+
+1. **Make sure `ssh` works without typing a password every time.** Usually this means a key and an
+   entry in `~/.ssh/config`:
+
+   ```
+   Host swc
+       HostName swc.ucl.ac.uk
+       User yourname
+       IdentityFile ~/.ssh/id_ed25519
+   ```
+
+2. **Tell switchboard about it.** Create `~/.config/switchboard/config.toml` containing:
+
+   ```toml
+   [hpc]
+   host = "swc"
+   ```
+
+3. **Check it works:**
+
+   ```bash
+   switchboard hpc check     # can we connect?
+   switchboard hpc probe     # what does the cluster allow? (read-only)
+   ```
+
+   If your cluster asks for two-factor authentication, run `switchboard hpc connect` once. switchboard
+   reuses that login for 12 hours.
+
+4. **Try a tiny test.** [examples/smoke-hpc.yaml](examples/smoke-hpc.yaml) runs 3 small jobs on the
+   cluster, and [examples/auto-hpc.yaml](examples/auto-hpc.yaml) splits 12 small jobs between the Mac
+   and the cluster.
+
+switchboard keeps its own small helper files in `~/.switchboard/` on the cluster. It doesn't touch
+anything else there, and you can still use `sbatch` yourself exactly as before.
+
+## Running in the background
+
+Without a background process, switchboard only does work when you type a command, or while
+`switchboard run` is open. To have it keep going on its own, including starting the next job the
+moment one finishes:
+
+```bash
+switchboard daemon install    # starts now and at every login
+switchboard daemon status
+switchboard daemon uninstall  # to remove it
+```
+
+---
+
+## Common questions
+
+**Will a job ever run twice?**
+Rarely, and it's handled. Suppose the connection to the cluster drops just as a job is submitted.
+switchboard looks the job up again by name instead of blindly resubmitting it. In the rare case where
+a run really does happen twice, only one result is accepted; the other is kept but marked
+`SUPERSEDED`.
+
+**What if I change my code while an experiment is running?**
+Add an `identity` section and switchboard notices:
+
+```yaml
+identity:
+  code: {git: {paths: ["src"]}}   # fingerprint the code in src/, including uncommitted edits
+```
+
+Every run then checks the code is the same as when you submitted, on the Mac and on the cluster.
+Runs with different code refuse to start rather than silently mixing versions. Resubmitting a
+changed experiment is refused too, with an explanation; use `--new-run` to start a fresh run
+alongside the old one.
+
+**Can I still use the cluster normally?**
+Yes. switchboard only manages the jobs it submitted. You can also turn any experiment into a plain
+Slurm job folder and run it entirely by hand:
+
+```bash
+switchboard export-slurm sweep.yaml --out my-sweep-job
+```
+
+**What happens if my laptop sleeps or I close the lid?**
+Jobs on the cluster carry on regardless. Jobs on the Mac pause while it sleeps and continue when it
+wakes. Next time switchboard looks, it catches up on everything that finished meanwhile.
+
+**Does it change my research code or repository?**
+No. It runs the command you give it in the folder you name, and only ever writes inside its output
+folders.
+
+**Is it safe to resubmit the same file?**
+Yes. Submitting an unchanged experiment again does nothing, and finished runs are not redone.
+
+---
+
+## Cheat sheet
+
+| I want to… | Command |
+|---|---|
+| check my setup | `switchboard doctor` |
+| start an experiment | `switchboard submit FILE.yaml --backend auto` |
+| see progress | `switchboard status [EXP]` |
+| understand one task | `switchboard explain EXP/N` |
+| read a task's output | `switchboard logs EXP/N` |
+| find the results | `switchboard results EXP` |
+| retry failures | `switchboard retry EXP --failed-only` |
+| stop things | `switchboard cancel EXP` or `cancel EXP/N` |
+| move work by hand | `switchboard assign EXP --backend hpc --count N` |
+| change routing | `switchboard policy EXP local-first` |
+| control the Mac budget | `switchboard mode auto` / `focus` / `away`, or `pause-local` |
+| run in the background | `switchboard daemon install` |
+| test the cluster link | `switchboard hpc check` |
+
+Every command also accepts `--json`, which is handy for scripts and for asking an AI assistant to
+manage experiments for you.
+
+## Configuration
+
+Settings live in `~/.config/switchboard/config.toml`. Everything is optional; this example shows the
+defaults you're most likely to change:
 
 ```toml
-[budgets.focus]                         # defaults shown; see docs/benchmarks/
+[budgets.focus]        # while you're using the Mac
 cpus = 4
 mem_gb = 12
-launch_prefix = ["nice", "-n", "10"]
 
-[budgets.away]
+[budgets.away]         # while you're away
 cpus = 12
 mem_gb = 28
 
 [local]
-pueue_group = "switchboard"
 run_on_battery = false
-memory_pressure_gate = true
-# pueue_config = "~/path/to/pueue.yml"  # default: Pueue's own config
 
-[daemon]
-local_interval_s = 5
-idle_interval_s = 300
-
-[activity]                              # mode auto thresholds (defaults shown)
-active_idle_s = 120
-away_idle_s = 600
-away_hold_s = 120
-busy_cores = 3.0
-quiet_cores = 1.0
-ignore_holders = []                     # added to the built-in ["corespeechd"]
-```
-
-## Cluster (Slurm over SSH)
-
-```toml
 [hpc]
-host = "mycluster"            # ~/.ssh/config alias; no credentials are stored
-remote_root = "~/.switchboard"
+host = "swc"           # your ~/.ssh/config alias
 ```
 
-**Connecting:**
-- `switchboard hpc connect` opens a persistent SSH session (authenticate once, MFA included).
-- `hpc check` and `hpc probe` are read-only: probe reports MaxArraySize, submit limits and the accounting type.
-- `hpc install` copies the stdlib runner into a directory named by its content hash.
+---
 
-**How tasks run:**
-- Tasks assigned to `hpc` are submitted as `sbatch --array` chunks, sized within MaxArraySize and your submit headroom.
-- Each chunk's job is named `sb-<launch>`. That name is how a submission whose reply was lost is found again, instead of being resubmitted.
-- Jobs use `--no-requeue`; retries are new attempts.
+## Learn more
 
-**Outcomes:**
-
-| Slurm outcome | Recorded as |
-|---|---|
-| TIMEOUT | `timeout` |
-| OUT_OF_MEMORY | `oom` |
-| NODE_FAIL | `node_fail` (retryable by default) |
-| PREEMPTED | an interruption: requeued without using a retry |
-| A `scancel` you ran yourself | the task is CANCELLED, not requeued |
-
-**Accounting and escape hatches:**
-- CPU and memory figures come from `sacct` step lines; `sacct -X` would omit them.
-- Every generated `job.sbatch` is self-contained.
-- `switchboard export-slurm SPEC --out DIR` writes a launch directory you can `sbatch` by hand, with no switchboard involved.
-
-## Spec
-
-See [examples/synthetic-grid.yaml](examples/synthetic-grid.yaml). The sections are:
-
-- **`command`:** the command to run. Placeholders: `{seed} {outdir} {params_file} {task_key} {attempt_id} {experiment} {idx} {cpus} {param.NAME}`.
-- **`params`:** `grid` (lists, `{linspace: [a, b, n]}`, `{range: [a, b, step]}`), `zip`, `seeds`, or a JSONL `manifest`.
-- **`resources`:** declared reservations. They are advisory admission bookkeeping, never kill limits.
-- **`outputs.expect`:** glob patterns that must exist and be non-empty in `{outdir}`. Exit code 0 alone is not success.
-- **`identity`:**
-  - `code` uses the `git` provider (HEAD + diff + untracked file contents) or `command`. It is pinned before any dispatch and must match on every backend.
-  - `env` uses `command`. It is pinned per platform.
-  - The shim re-checks both before running, and refuses to run on a mismatch.
-- **`retries`:** `max` and `on` (`nonzero`, `missing_outputs`, `lost`, `runner_died`, …).
-- **`interruptible`:** default `false`.
-- **`compat: slurm-array`:** exports `SLURM_ARRAY_TASK_ID` locally.
-- **`backends`:** for each of `local` and `hpc`, a `workdir`, `output_root` and `setup` (a shell snippet). Local relative paths resolve against the spec file.
-
-**Run identity.**
-- Resubmitting an unchanged spec is a no-op.
-- Changing an identity field, the code, or a pinned environment is refused with a diff. Use `--new-run` to start `name#2`.
-- Resources and other non-identity fields can change; the change applies only to tasks that are still pending.
-
-## Layout
-
-- **Task attempts** go in `<output_root>/<experiment>/<task_key>/<attempt_id>/`, which holds:
-  - `.claim/`
-  - `status.json`
-  - `stdout.log` / `stderr.log`
-  - `params.json`
-  - `out/`, which is `{outdir}`
-  - `_SUCCESS`
-- **Downstream analysis** should read `switchboard results`, not glob directories.
-
-| Module | Role |
-|---|---|
-| `spec.py` | validation, expansion, identity hash, templating |
-| `registry/` | SQLite schema, WAL transactions, state machine with event log |
-| `runner/shim.py`, `runner/fingerprint.py` | stdlib-only, Python ≥ 3.8; shipped verbatim to the HPC in M3 |
-| `executors/` | executor protocol; `pueue.py` (local, Pueue 4.x); `slurm.py` + `transport.py` (SSH); `fake.py` test double |
-| `export.py` | registry-free, self-contained Slurm launch directories |
-| `tools/mock_slurm/` | sbatch/squeue/sacct/scancel/scontrol/sacctmgr stand-ins with fault injection (tests) |
-| `macos.py` | memory pressure, power, idle time, lock/display state, assertion holders, foreign CPU |
-| `activity.py` | pure activity classifier with hysteresis (ACTIVE -> focus, AWAY -> away) |
-| `daemon.py`, `launchd.py` | adaptive background loop with nudge socket and lock; LaunchAgent install |
-| `controller.py` | submit/assign with identity pinning, reconcile, acceptance CAS, admission |
-| `policy.py` | pure static-budget admission |
-| `routing.py` | pure routing rules R1–R5 with explainable decisions |
-| `tools/synth.py` | synthetic workloads |
-| `tools/bench_responsiveness.py` | QoS / responsiveness benchmark (run on AC power) |
-
-## Tests
-
-```bash
-uv run pytest            # excludes @cluster; @pueue tests start their own isolated pueued
-                         # (skipped if Pueue is missing); shim tests also run under /usr/bin/python3
-```
+- [docs/technical.md](docs/technical.md): the full reference. It covers the routing rules,
+  guarantees, every config key, the Slurm details and the code layout.
+- [docs/benchmarks/](docs/benchmarks/): how the Mac budgets were chosen.
+- [docs/m3-cluster-checklist.md](docs/m3-cluster-checklist.md): a step-by-step first run on a new
+  cluster.
