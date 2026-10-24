@@ -1,0 +1,15 @@
+# Real-cluster smoke test (docs/m3-cluster-checklist.md, step 5): 3 tiny tasks, one 3-element array.
+# Needs nothing on the cluster except python3; outputs go to ~/switchboard-smoke on the cluster.
+experiment: smoke-hpc
+command: ["python3", "-c",
+          "import json, os, sys, time; time.sleep(20); json.dump({{'seed': int(sys.argv[1]), 'host': os.uname().nodename}}, open(os.path.join(sys.argv[2], 'result.json'), 'w'))",
+          "{seed}", "{outdir}"]
+params:
+  seeds: [1, 2, 3]
+resources: {cpus: 1, mem_gb: 0.5, runtime_min: 1}
+outputs: {expect: ["result.json"]}
+backends:
+  hpc:
+    workdir: "~"
+    output_root: "~/switchboard-smoke"
+    slurm: {partition: cpu, time: "00:05:00"}

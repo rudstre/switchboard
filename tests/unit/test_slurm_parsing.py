@@ -80,3 +80,21 @@ def test_job_script():
                  "#SBATCH --partition=short", "#SBATCH --constraint=intel"]:
         assert line in script
     assert 'array.py /home/u/.switchboard/launch/l-1/manifest.jsonl "$SLURM_ARRAY_TASK_ID"' in script
+
+
+def test_real_sacct_output_from_swc():
+    """Captured from the SWC cluster (Slurm 23.11.4, jobacct_gather/cgroup) after the M3 smoke test.
+
+    Notes: extern steps report MaxRSS as a bare 0; the array job id equals the *last* element's raw id;
+    cgroup sampling barely registers 20-second jobs (48K-240K vs ~17 MB measured by the shim).
+    """
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "fixtures" / "sacct-swc-completed.txt").read_text()
+    acct = aggregate_sacct(text)
+    assert sorted(acct) == [("3827293", 0), ("3827293", 1), ("3827293", 2)]
+    for e in acct.values():
+        obs = observation_from_account(e)
+        assert (obs.state, obs.exit_code, obs.reason) == ("DONE", 0, None)
+        assert e.wall_s == 20 and 0 < e.cpu_s < 1 and e.peak_rss_mb is not None
+    assert acct[("3827293", 2)].peak_rss_mb == pytest.approx(240 / 1024)
