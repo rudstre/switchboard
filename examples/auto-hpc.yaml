@@ -1,0 +1,25 @@
+# Real-cluster test of automatic routing: 12 tiny tasks submitted with `--backend auto`.
+# Each task *declares* 30 min (which drives routing) but really sleeps 15 s. With a 1 h local wait at the
+# 'focus' budget (4 cpus), local-first should keep 8 tasks on the Mac and overflow 4 to the cluster.
+experiment: auto-hpc
+command: ["python3", "-c",
+          "import json, os, platform, sys, time; time.sleep(15); json.dump({{'seed': int(sys.argv[1]), 'host': platform.node(), 'system': platform.system()}}, open(os.path.join(sys.argv[2], 'result.json'), 'w'))",
+          "{seed}", "{outdir}"]
+params:
+  seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+resources: {cpus: 1, mem_gb: 0.5, runtime_min: 30}
+outputs: {expect: ["result.json"]}
+identity:
+  code: {command: "echo auto-hpc-v1"}                              # same on both machines
+  env: {command: "python3 -c 'import sys; print(sys.version_info[0])'"}  # pinned per platform
+placement:
+  policy: local-first
+  max_local_wait_h: 1
+backends:
+  local:
+    workdir: "."
+    output_root: "../sb-out"
+  hpc:
+    workdir: "~"
+    output_root: "~/switchboard-autotest"
+    slurm: {partition: cpu, time: "00:05:00"}
